@@ -34,5 +34,7 @@ public class FBX_Exporter : ModuleRules
 			"ToolMenus",
 			"UnrealEd"
 		});
+
+		AddEngineThirdPartyPrivateStaticDependencies(Target, "FBX");
 	}
 }

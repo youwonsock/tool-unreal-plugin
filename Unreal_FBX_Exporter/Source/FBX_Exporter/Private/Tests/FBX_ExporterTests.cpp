@@ -16,6 +16,7 @@ bool FFBXExporterSafeFileNameTest::RunTest(const FString& Parameters)
 {
 	TestEqual(TEXT("Invalid path characters are replaced"), FBXExporter::MakeSafeFileName(TEXT("Mesh:01/LOD*0")), TEXT("Mesh_01_LOD_0"));
 	TestEqual(TEXT("Empty names receive a stable fallback"), FBXExporter::MakeSafeFileName(TEXT("   ")), TEXT("Unnamed"));
+	TestEqual(TEXT("Path traversal components receive a stable fallback"), FBXExporter::MakeSafeFileName(TEXT("..")), TEXT("Unnamed"));
 	return true;
 }
 
@@ -37,9 +38,36 @@ bool FFBXExporterMaskPackingTest::RunTest(const FString& Parameters)
 	{
 		TestEqual(TEXT("Metallic is packed in R"), Pixel.R, static_cast<uint8>(10));
 		TestEqual(TEXT("Ambient Occlusion is packed in G"), Pixel.G, static_cast<uint8>(20));
+		TestEqual(TEXT("Mask reserves B with opaque value"), Pixel.B, static_cast<uint8>(255));
 		TestEqual(TEXT("Smoothness is inverse roughness in A"), Pixel.A, static_cast<uint8>(225));
 	}
 
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FFBXExporterTextureMapOptionsTest,
+	"FBX_Exporter.Editor.StaticMeshTextureExport.TextureMapOptions",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FFBXExporterTextureMapOptionsTest::RunTest(const FString& Parameters)
+{
+	const FFBXExporterOptions Defaults;
+	TestEqual(TEXT("Texture maps default to All"), Defaults.TextureMaps, EFBXExporterTextureMap::All);
+	TestFalse(TEXT("Embedding defaults to disabled"), Defaults.bEmbedTexturesInFbx);
+
+	const EFBXExporterTextureMap BaseColorOnly = EFBXExporterTextureMap::BaseColor;
+	const EFBXExporterTextureMap BaseColorDependencies = FBXExporter::GetRequiredTextureMapsForBake(BaseColorOnly);
+	TestTrue(TEXT("BaseColor dependency includes opacity"), IsFBXExporterTextureMapEnabled(BaseColorDependencies, EFBXExporterTextureMap::Opacity));
+	TestFalse(TEXT("BaseColor dependency does not add unrelated normal"), IsFBXExporterTextureMapEnabled(BaseColorDependencies, EFBXExporterTextureMap::Normal));
+
+	const EFBXExporterTextureMap MaskDependencies = FBXExporter::GetRequiredTextureMapsForBake(EFBXExporterTextureMap::Mask);
+	TestTrue(TEXT("Mask dependency includes occlusion"), IsFBXExporterTextureMapEnabled(MaskDependencies, EFBXExporterTextureMap::Occlusion));
+	TestTrue(TEXT("Mask dependency includes the mask output"), IsFBXExporterTextureMapEnabled(MaskDependencies, EFBXExporterTextureMap::Mask));
+
+	TestEqual(TEXT("No selected maps has no bake dependency"),
+		FBXExporter::GetRequiredTextureMapsForBake(EFBXExporterTextureMap::None),
+		EFBXExporterTextureMap::None);
 	return true;
 }
 
@@ -146,6 +174,33 @@ bool FFBXExporterStagingRollbackTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Restored file keeps the original contents"), RestoredContents, TEXT("previous"));
 	TestTrue(TEXT("The blocking destination remains intact"), IFileManager::Get().DirectoryExists(*BlockingDirectory));
 	TestFalse(TEXT("The backup directory is cleaned up"), IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous"))));
+
+	IFileManager::Get().DeleteDirectory(*RootDirectory, false, true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FFBXExporterStagingReplacesFolderTest,
+	"FBX_Exporter.Editor.StaticMeshTextureExport.StagingReplacesFolder",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FFBXExporterStagingReplacesFolderTest::RunTest(const FString& Parameters)
+{
+	const FString RootDirectory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("FBX_ExporterTests"), FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString StagingDirectory = RootDirectory / TEXT("Staging");
+	const FString FinalDirectory = RootDirectory / TEXT("Final");
+	IFileManager::Get().MakeDirectory(*StagingDirectory, true);
+	IFileManager::Get().MakeDirectory(*FinalDirectory, true);
+	FFileHelper::SaveStringToFile(TEXT("user file"), *(FinalDirectory / TEXT("user.txt")));
+	FFileHelper::SaveStringToFile(TEXT("fresh"), *(StagingDirectory / TEXT("new.txt")));
+
+	FString Error;
+	TestTrue(TEXT("Folder publish succeeds"), FBXExporter::Testing::PublishStagedFiles(StagingDirectory, FinalDirectory, Error));
+	TestFalse(TEXT("Stale user files are removed with the old folder"), IFileManager::Get().FileExists(*(FinalDirectory / TEXT("user.txt"))));
+	FString Contents;
+	TestTrue(TEXT("The staged file is published"), FFileHelper::LoadFileToString(Contents, *(FinalDirectory / TEXT("new.txt"))));
+	TestEqual(TEXT("Published content is unchanged"), Contents, TEXT("fresh"));
+	TestFalse(TEXT("The backup directory is removed after success"), IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous"))));
 
 	IFileManager::Get().DeleteDirectory(*RootDirectory, false, true);
 	return true;

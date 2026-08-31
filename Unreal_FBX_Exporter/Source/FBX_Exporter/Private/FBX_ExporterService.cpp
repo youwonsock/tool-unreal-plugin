@@ -1,4 +1,5 @@
 #include "FBX_ExporterService.h"
+#include "FBX_ExporterFbxMedia.h"
 
 #include "AssetExportTask.h"
 #include "AssetRegistry/AssetData.h"
@@ -6,6 +7,7 @@
 #include "ContentBrowserMenuContexts.h"
 #include "DesktopPlatformModule.h"
 #include "Engine/Engine.h"
+#include "Engine/EngineTypes.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Exporters/Exporter.h"
@@ -20,17 +22,25 @@
 #include "MaterialExpressionIO.h"
 #include "MaterialShared.h"
 #include "MaterialUtilities.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialExpressionCustom.h"
+#include "Materials/MaterialExpressionTextureCoordinate.h"
+#include "Materials/MaterialExpressionTextureSampleParameter.h"
 #include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstance.h"
+#include "Materials/MaterialParameters.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "MeshDescription.h"
 #include "Modules/ModuleManager.h"
+#include "StaticMeshResources.h"
 #include "StaticMeshAttributes.h"
 #include "StaticMeshComponentAdapter.h"
 #include "ToolMenus.h"
@@ -82,6 +92,7 @@ namespace
 	{
 		TMap<FString, TArray<FColor>> MapPixels;
 		TArray<FString> Warnings;
+		float EmissionScale = 1.0f;
 	};
 
 	struct FExportDialogState
@@ -90,6 +101,8 @@ namespace
 		FString OutputRoot;
 		int32 BakeResolution = 2048;
 		bool bReuseDirectTextures = true;
+		EFBXExporterTextureMap TextureMaps = EFBXExporterTextureMap::All;
+		bool bEmbedTexturesInFbx = false;
 	};
 
 	struct FBatchExportSummary
@@ -104,6 +117,82 @@ namespace
 	FString GetMapFileName(const FString& MaterialName, const FString& MapName)
 	{
 		return FString::Printf(TEXT("%s_%s.png"), *MakeSafeFileName(MaterialName), *MapName);
+	}
+
+	const TArray<FString>& GetTextureMapNames()
+	{
+		static const TArray<FString> Names = {
+			TEXT("BaseColor"), TEXT("Normal"), TEXT("Mask"), TEXT("Occlusion"), TEXT("Emission"), TEXT("Opacity")};
+		return Names;
+	}
+
+	FString GetOpacityMapName(const UMaterialInterface* Material)
+	{
+		return Material && Material->GetBlendMode() == BLEND_Masked ? TEXT("OpacityMask") : TEXT("Opacity");
+	}
+
+	FString GetBlendModeName(const UMaterialInterface* Material)
+	{
+		if (!Material)
+		{
+			return TEXT("Opaque");
+		}
+		switch (Material->GetBlendMode())
+		{
+		case BLEND_Masked: return TEXT("Masked");
+		case BLEND_Translucent: return TEXT("Translucent");
+		case BLEND_Additive: return TEXT("Additive");
+		case BLEND_Modulate: return TEXT("Modulate");
+		case BLEND_AlphaComposite: return TEXT("AlphaComposite");
+		case BLEND_AlphaHoldout: return TEXT("AlphaHoldout");
+		default: return TEXT("Opaque");
+		}
+	}
+
+	EFBXExporterTextureMap GetRequiredBakeMaps(const EFBXExporterTextureMap SelectedMaps)
+	{
+		EFBXExporterTextureMap Required = EFBXExporterTextureMap::None;
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::BaseColor))
+		{
+			Required |= EFBXExporterTextureMap::BaseColor;
+			// BaseColor always keeps alpha semantics, even when standalone opacity
+			// output was not selected.
+			Required |= EFBXExporterTextureMap::Opacity;
+		}
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Opacity))
+		{
+			Required |= EFBXExporterTextureMap::Opacity;
+		}
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Mask))
+		{
+			Required |= EFBXExporterTextureMap::Mask;
+			Required |= EFBXExporterTextureMap::Occlusion;
+		}
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Occlusion))
+		{
+			Required |= EFBXExporterTextureMap::Occlusion;
+		}
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Normal))
+		{
+			Required |= EFBXExporterTextureMap::Normal;
+		}
+		if (IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Emission))
+		{
+			Required |= EFBXExporterTextureMap::Emission;
+		}
+		return Required;
+	}
+
+	bool IsMapSelected(const EFBXExporterTextureMap SelectedMaps, const FString& MapName)
+	{
+		if (MapName == TEXT("BaseColor")) return IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::BaseColor);
+		if (MapName == TEXT("Normal")) return IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Normal);
+		if (MapName == TEXT("Mask")) return IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Mask);
+		if (MapName == TEXT("Occlusion")) return IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Occlusion);
+		if (MapName == TEXT("Emission")) return IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Emission);
+		return MapName == TEXT("Opacity") || MapName == TEXT("OpacityMask")
+			? IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Opacity)
+			: false;
 	}
 
 	bool SaveImage(const FString& FilePath, const TArray<FColor>& Pixels, const int32 Width, const int32 Height, const bool bSRGB, FString& OutError)
@@ -170,7 +259,7 @@ namespace
 		UTexture2D* Texture,
 		const int32 TargetWidth,
 		const int32 TargetHeight,
-		const bool bSRGB,
+		const bool bSourceSRGB,
 		TArray<FColor>& OutPixels)
 	{
 		if (!Texture)
@@ -184,11 +273,15 @@ namespace
 			return false;
 		}
 
+		// Texture sampling uses the texture asset's SRGB flag, not merely the
+		// gamma metadata stored in the source file. Decode to linear first so the
+		// selected channel and any resize have the same meaning as the material
+		// sample. FImage formats without gamma support ignore this field.
+		SourceImage.GammaSpace = bSourceSRGB
+			? (Texture->bUseLegacyGamma ? EGammaSpace::Pow22 : EGammaSpace::sRGB)
+			: EGammaSpace::Linear;
 		FImage ConvertedImage;
-		SourceImage.CopyTo(
-			ConvertedImage,
-			ERawImageFormat::BGRA8,
-			bSRGB ? EGammaSpace::sRGB : EGammaSpace::Linear);
+		SourceImage.CopyTo(ConvertedImage, ERawImageFormat::BGRA8, EGammaSpace::Linear);
 
 		const TArrayView64<const FColor> ConvertedView = ConvertedImage.AsBGRA8();
 		TArray<FColor> ConvertedPixels;
@@ -197,10 +290,84 @@ namespace
 			ConvertedPixels,
 			ConvertedImage.SizeX,
 			ConvertedImage.SizeY,
-			bSRGB,
+			false,
 			TargetWidth,
 			TargetHeight,
 			OutPixels);
+	}
+
+	enum class EDirectTextureChannel : uint8
+	{
+		RGB,
+		RGBA,
+		R,
+		G,
+		B,
+		A
+	};
+
+	struct FDirectTextureBinding
+	{
+		UTexture2D* Texture = nullptr;
+		EDirectTextureChannel Channel = EDirectTextureChannel::RGB;
+	};
+
+	bool LoadDirectTexturePixels(
+		const FDirectTextureBinding& Binding,
+		const int32 TargetWidth,
+		const int32 TargetHeight,
+		const bool bSRGB,
+		TArray<FColor>& OutPixels)
+	{
+		if (!Binding.Texture)
+		{
+			return false;
+		}
+		TArray<FColor> SourcePixels;
+		// Decode according to the source texture's SRGB flag, then encode the
+		// generated PNG in its destination color space below.
+		if (!LoadTexturePixels(Binding.Texture, TargetWidth, TargetHeight, Binding.Texture->SRGB, SourcePixels))
+		{
+			return false;
+		}
+		if (Binding.Channel == EDirectTextureChannel::RGB || Binding.Channel == EDirectTextureChannel::RGBA)
+		{
+			if (bSRGB)
+			{
+				for (FColor& Pixel : SourcePixels)
+				{
+					// LoadTexturePixels stores a quantized *linear* value.  The
+					// FLinearColor(FColor) constructor assumes sRGB input, so use
+					// the explicit linear reinterpretation before encoding.
+					Pixel = Pixel.ReinterpretAsLinear().ToFColorSRGB();
+				}
+			}
+			OutPixels = MoveTemp(SourcePixels);
+			return true;
+		}
+		for (FColor& Pixel : SourcePixels)
+		{
+			uint8 Value = Pixel.R;
+			switch (Binding.Channel)
+			{
+			case EDirectTextureChannel::G: Value = Pixel.G; break;
+			case EDirectTextureChannel::B: Value = Pixel.B; break;
+			case EDirectTextureChannel::A: Value = Pixel.A; break;
+			default: break;
+			}
+			Pixel = FColor(Value, Value, Value, 255);
+		}
+		if (bSRGB)
+		{
+			for (FColor& Pixel : SourcePixels)
+			{
+				const float LinearValue = static_cast<float>(Pixel.R) / 255.0f;
+				const FColor Encoded = FLinearColor(LinearValue, LinearValue, LinearValue, 1.0f).ToFColorSRGB();
+				Pixel = FColor(Encoded.R, Encoded.G, Encoded.B, 255);
+			}
+		}
+		OutPixels = MoveTemp(SourcePixels);
+		return true;
 	}
 
 	bool GetBakedPropertyPixels(
@@ -239,32 +406,176 @@ namespace
 			OutPixels);
 	}
 
-	UTexture2D* FindDirectTexture(UMaterialInterface* Material, const EMaterialProperty Property)
+	bool IsTextureAdjustmentDefault(const UTexture2D* Texture)
 	{
-		if (!Material || Material->IsA<UMaterialInstance>())
+		if (!Texture)
 		{
-			return nullptr;
+			return false;
 		}
+		return FMath::IsNearlyEqual(Texture->AdjustBrightness, 1.0f) &&
+			FMath::IsNearlyEqual(Texture->AdjustBrightnessCurve, 1.0f) &&
+			FMath::IsNearlyZero(Texture->AdjustVibrance) &&
+			FMath::IsNearlyEqual(Texture->AdjustSaturation, 1.0f) &&
+			FMath::IsNearlyEqual(Texture->AdjustRGBCurve, 1.0f) &&
+			FMath::IsNearlyZero(Texture->AdjustHue) &&
+			FMath::IsNearlyZero(Texture->AdjustMinAlpha) &&
+			FMath::IsNearlyEqual(Texture->AdjustMaxAlpha, 1.0f) &&
+			!Texture->bFlipGreenChannel &&
+			!Texture->bChromaKeyTexture &&
+			Texture->PowerOfTwoMode == ETexturePowerOfTwoSetting::None;
+	}
 
+	EDirectTextureChannel GetDirectTextureChannel(const FExpressionInput& Input, const bool bColorProperty, bool& bValid)
+	{
+		bValid = true;
+		const int32 ExplicitMask = Input.MaskR + Input.MaskG + Input.MaskB + Input.MaskA;
+		if (Input.Mask)
+		{
+			if (ExplicitMask == 0)
+			{
+				bValid = false;
+				return EDirectTextureChannel::R;
+			}
+			// TextureSample's RGB/RGBA outputs carry a multi-channel mask.  They
+			// are valid for color properties; scalar properties must select exactly
+			// one channel so that a vector-to-scalar implicit conversion cannot
+			// silently change the exported value.
+			const bool bRGB = Input.MaskR && Input.MaskG && Input.MaskB && !Input.MaskA;
+			const bool bRGBA = Input.MaskR && Input.MaskG && Input.MaskB && Input.MaskA;
+			if (bColorProperty && bRGB)
+			{
+				return EDirectTextureChannel::RGB;
+			}
+			if (bColorProperty && bRGBA)
+			{
+				return EDirectTextureChannel::RGBA;
+			}
+			if (!bColorProperty && ExplicitMask != 1)
+			{
+				bValid = false;
+				return EDirectTextureChannel::R;
+			}
+			if (bColorProperty && ExplicitMask > 1)
+			{
+				bValid = false;
+				return EDirectTextureChannel::RGB;
+			}
+		}
+		if (Input.MaskA || Input.OutputIndex == 4)
+		{
+			return EDirectTextureChannel::A;
+		}
+		if (Input.MaskG || Input.OutputIndex == 2)
+		{
+			return EDirectTextureChannel::G;
+		}
+		if (Input.MaskB || Input.OutputIndex == 3)
+		{
+			return EDirectTextureChannel::B;
+		}
+		if (Input.MaskR || Input.OutputIndex == 1 || !bColorProperty)
+		{
+			if (!bColorProperty && !Input.Mask && Input.OutputIndex != 1 && Input.OutputIndex != 2 && Input.OutputIndex != 3 && Input.OutputIndex != 4)
+			{
+				bValid = false;
+			}
+			return EDirectTextureChannel::R;
+		}
+		if (Input.OutputIndex == 5)
+		{
+			return EDirectTextureChannel::RGBA;
+		}
+		if (Input.OutputIndex != 0)
+		{
+			bValid = false;
+		}
+		return EDirectTextureChannel::RGB;
+	}
+
+	bool FindDirectTexture(UMaterialInterface* Material, const EMaterialProperty Property, FDirectTextureBinding& OutBinding)
+	{
+		OutBinding = FDirectTextureBinding();
+		if (!Material)
+		{
+			return false;
+		}
 		UMaterial* BaseMaterial = Material->GetMaterial();
 		if (!BaseMaterial)
 		{
-			return nullptr;
+			return false;
 		}
-
-		TArray<UMaterialExpression*> Expressions;
-		if (!BaseMaterial->GetExpressionsInPropertyChain(Property, Expressions, nullptr) || Expressions.Num() != 1)
+		FExpressionInput* PropertyInput = BaseMaterial->GetExpressionInputForProperty(Property);
+		if (!PropertyInput)
 		{
-			return nullptr;
+			return false;
 		}
-
-		UMaterialExpressionTextureSample* TextureSample = Cast<UMaterialExpressionTextureSample>(Expressions[0]);
-		if (!TextureSample || TextureSample->TextureObject.Expression || TextureSample->Coordinates.Expression)
+		const FExpressionInput TracedInput = PropertyInput->GetTracedInput();
+		UMaterialExpressionTextureSample* TextureSample = Cast<UMaterialExpressionTextureSample>(TracedInput.Expression);
+		if (!TextureSample || TextureSample->TextureObject.Expression ||
+			TextureSample->MipValue.Expression || TextureSample->CoordinatesDX.Expression || TextureSample->CoordinatesDY.Expression ||
+			TextureSample->AutomaticViewMipBiasValue.Expression ||
+			TextureSample->AutomaticViewMipBias || TextureSample->GatherMode != TGM_None ||
+			TextureSample->MipValueMode != TMVM_None || TextureSample->SamplerSource != SSM_FromTextureAsset ||
+			TextureSample->ConstCoordinate != 0)
 		{
-			return nullptr;
+			return false;
 		}
-
-		return Cast<UTexture2D>(TextureSample->Texture);
+		const FExpressionInput CoordinateInput = TextureSample->Coordinates.GetTracedInput();
+		if (CoordinateInput.Mask || CoordinateInput.OutputIndex != 0)
+		{
+			return false;
+		}
+		if (CoordinateInput.Expression)
+		{
+			const UMaterialExpressionTextureCoordinate* TextureCoordinate = Cast<UMaterialExpressionTextureCoordinate>(CoordinateInput.Expression);
+			if (!TextureCoordinate || TextureCoordinate->CoordinateIndex != 0 ||
+				!FMath::IsNearlyEqual(TextureCoordinate->UTiling, 1.0f) ||
+				!FMath::IsNearlyEqual(TextureCoordinate->VTiling, 1.0f) ||
+				TextureCoordinate->UnMirrorU || TextureCoordinate->UnMirrorV)
+			{
+				return false;
+			}
+		}
+		UTexture2D* Texture = Cast<UTexture2D>(TextureSample->Texture);
+		if (const UMaterialExpressionTextureSampleParameter* Parameter = Cast<UMaterialExpressionTextureSampleParameter>(TextureSample))
+		{
+			UTexture* ParameterTexture = nullptr;
+			if (!Material->GetTextureParameterValue(FHashedMaterialParameterInfo(Parameter->ParameterName), ParameterTexture) || !ParameterTexture)
+			{
+				// A material instance may leave a parameter at the base material's
+				// default.  In that case the expression's Texture field is still the
+				// exact sampled source and remains eligible for direct reuse.
+				ParameterTexture = TextureSample->Texture;
+			}
+			Texture = Cast<UTexture2D>(ParameterTexture);
+		}
+		if (!Texture || !IsTextureAdjustmentDefault(Texture))
+		{
+			return false;
+		}
+		if (Texture->VirtualTextureStreaming || IsVirtualSamplerType(TextureSample->SamplerType))
+		{
+			return false;
+		}
+		switch (TextureSample->SamplerType)
+		{
+		case SAMPLERTYPE_Color:
+		case SAMPLERTYPE_Grayscale:
+		case SAMPLERTYPE_Alpha:
+		case SAMPLERTYPE_Normal:
+		case SAMPLERTYPE_Masks:
+		case SAMPLERTYPE_LinearColor:
+		case SAMPLERTYPE_LinearGrayscale:
+		case SAMPLERTYPE_Data:
+			break;
+		default:
+			return false;
+		}
+		const bool bColorProperty = Property == MP_BaseColor || Property == MP_Normal || Property == MP_EmissiveColor;
+		bool bChannelValid = false;
+		OutBinding.Texture = Texture;
+		OutBinding.Channel = GetDirectTextureChannel(TracedInput, bColorProperty, bChannelValid);
+		return bChannelValid;
 	}
 
 	bool ExportFbx(UStaticMesh* StaticMesh, const FString& FilePath, FString& OutError)
@@ -280,6 +591,7 @@ namespace
 		ExportTask->bWriteEmptyFiles = false;
 
 		UFbxExportOption* ExportOptions = NewObject<UFbxExportOption>(ExportTask);
+		ExportOptions->FbxExportCompatibility = EFbxExportCompatibility::FBX_2013;
 		ExportOptions->bASCII = false;
 		ExportOptions->LevelOfDetail = false;
 		ExportOptions->Collision = false;
@@ -314,6 +626,13 @@ namespace
 		FBakedMaterialData& OutMaterialData,
 		FString& OutError)
 	{
+		OutMaterialData = FBakedMaterialData();
+		const EFBXExporterTextureMap SelectedMaps = Options.TextureMaps;
+		if (SelectedMaps == EFBXExporterTextureMap::None)
+		{
+			return true;
+		}
+
 		UStaticMeshComponent* TransientComponent = NewObject<UStaticMeshComponent>(GetTransientPackage());
 		TransientComponent->SetStaticMesh(StaticMesh);
 		FStaticMeshComponentAdapter Adapter(TransientComponent);
@@ -375,20 +694,69 @@ namespace
 			}
 		}
 
-		const FIntPoint BakeSize(Options.BakeResolution, Options.BakeResolution);
-		const EMaterialProperty Properties[] = {
-			MP_BaseColor,
-			MP_Normal,
-			MP_Metallic,
-			MP_Roughness,
-			MP_AmbientOcclusion,
-			MP_EmissiveColor,
-			MP_Opacity,
-			MP_OpacityMask
+		const EMaterialProperty OpacityProperty = Material->GetBlendMode() == BLEND_Masked ? MP_OpacityMask : MP_Opacity;
+		const EFBXExporterTextureMap RequiredMaps = GetRequiredBakeMaps(SelectedMaps);
+		TArray<EMaterialProperty> Properties;
+		auto AddProperty = [&Properties](const EMaterialProperty Property)
+		{
+			if (!Properties.Contains(Property))
+			{
+				Properties.Add(Property);
+			}
 		};
+		if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::BaseColor)) AddProperty(MP_BaseColor);
+		if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Normal)) AddProperty(MP_Normal);
+		if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Mask))
+		{
+			AddProperty(MP_Metallic);
+			AddProperty(MP_AmbientOcclusion);
+			AddProperty(MP_Roughness);
+		}
+		else if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Occlusion))
+		{
+			AddProperty(MP_AmbientOcclusion);
+		}
+		if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Emission)) AddProperty(MP_EmissiveColor);
+		if (IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Opacity)) AddProperty(OpacityProperty);
+
+		TMap<EMaterialProperty, FDirectTextureBinding> DirectTextures;
+		if (Options.bReuseDirectTextures)
+		{
+			for (const EMaterialProperty Property : Properties)
+			{
+				FDirectTextureBinding Binding;
+				if (FindDirectTexture(Material, Property, Binding))
+				{
+					DirectTextures.Add(Property, Binding);
+				}
+			}
+		}
+
+		const FIntPoint BakeSize(Options.BakeResolution, Options.BakeResolution);
+		// A direct binding is only a fast path.  Validate that its source pixels
+		// can actually be read before omitting the corresponding bake property;
+		// otherwise a missing source image would silently turn into a default
+		// color instead of being baked from the material graph.
+		for (auto DirectIt = DirectTextures.CreateIterator(); DirectIt; ++DirectIt)
+		{
+			const EMaterialProperty Property = DirectIt.Key();
+			const bool bSRGB = Property == MP_BaseColor || Property == MP_EmissiveColor;
+			TArray<FColor> ProbePixels;
+			if (!LoadDirectTexturePixels(DirectIt.Value(), Options.BakeResolution, Options.BakeResolution, bSRGB, ProbePixels))
+			{
+				OutMaterialData.Warnings.Add(FString::Printf(
+					TEXT("Direct texture could not be read for material property %d; baking the material graph instead."),
+					static_cast<int32>(Property)));
+				DirectIt.RemoveCurrent();
+			}
+			ProbePixels.Reset();
+		}
 		for (const EMaterialProperty Property : Properties)
 		{
-			MaterialSettings.PropertySizes.Add(Property, BakeSize);
+			if (!DirectTextures.Contains(Property))
+			{
+				MaterialSettings.PropertySizes.Add(Property, BakeSize);
+			}
 		}
 
 		TArray<FMaterialData*> MaterialSettingsArray;
@@ -400,19 +768,14 @@ namespace
 		IMaterialBakingModule& MaterialBakingModule = FModuleManager::LoadModuleChecked<IMaterialBakingModule>(TEXT("MaterialBaking"));
 		MaterialBakingModule.SetEmissiveHDR(false);
 		MaterialBakingModule.SetLinearBake(true);
-		MaterialBakingModule.BakeMaterials(MaterialSettingsArray, MeshSettingsArray, BakeOutput);
-
-		TMap<EMaterialProperty, UTexture2D*> DirectTextures;
-		if (Options.bReuseDirectTextures)
+		if (!MaterialSettings.PropertySizes.IsEmpty())
 		{
-			for (const EMaterialProperty Property : Properties)
-			{
-				if (UTexture2D* DirectTexture = FindDirectTexture(Material, Property))
-				{
-					DirectTextures.Add(Property, DirectTexture);
-				}
-			}
+			MaterialBakingModule.BakeMaterials(MaterialSettingsArray, MeshSettingsArray, BakeOutput);
 		}
+		// The baking module keeps this as process-wide state.  Restore its
+		// ordinary editor default after the synchronous bake has captured its
+		// per-property color-space metadata.
+		MaterialBakingModule.SetLinearBake(false);
 		if (BakeOutput.PropertyData.IsEmpty() && DirectTextures.IsEmpty())
 		{
 			OutError = FString::Printf(TEXT("Material bake returned no property data for slot %d (%s)."), SlotIndex, *Material->GetName());
@@ -421,9 +784,9 @@ namespace
 
 		auto GetProperty = [&](const EMaterialProperty Property, const FColor DefaultColor, const bool bSRGB, TArray<FColor>& OutPixels)
 		{
-			if (UTexture2D* DirectTexture = DirectTextures.FindRef(Property))
+			if (const FDirectTextureBinding* DirectTexture = DirectTextures.Find(Property))
 			{
-				if (LoadTexturePixels(DirectTexture, Options.BakeResolution, Options.BakeResolution, bSRGB, OutPixels))
+				if (LoadDirectTexturePixels(*DirectTexture, Options.BakeResolution, Options.BakeResolution, bSRGB, OutPixels))
 				{
 					return true;
 				}
@@ -440,52 +803,135 @@ namespace
 				DefaultColor,
 				OutPixels);
 		};
+		auto ReleaseBakedProperty = [&BakeOutput](const EMaterialProperty Property)
+		{
+			BakeOutput.PropertyData.Remove(Property);
+			BakeOutput.PropertySizes.Remove(Property);
+			BakeOutput.HDRPropertyData.Remove(Property);
+			BakeOutput.PropertyIsLinearColor.Remove(Property);
+		};
 
+		const bool bNeedBaseColor = IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::BaseColor);
+		const bool bNeedNormal = IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Normal);
+		const bool bNeedEmission = IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Emission);
+		const bool bNeedOpacity = IsFBXExporterTextureMapEnabled(RequiredMaps, EFBXExporterTextureMap::Opacity);
+		auto SaveMap = [&](const FString& MapName, TArray<FColor>&& Pixels)
+		{
+			OutMaterialData.MapPixels.Add(MapName, MoveTemp(Pixels));
+		};
+
+		// BaseColor and opacity are evaluated together so BaseColor alpha always
+		// carries the material's opacity convention.  Release both buffers before
+		// evaluating any of the scalar maps.
 		TArray<FColor> BaseColor;
-		TArray<FColor> Normal;
-		TArray<FColor> Emission;
 		TArray<FColor> Opacity;
-		if (!GetProperty(MP_BaseColor, FColor::White, true, BaseColor) ||
-			!GetProperty(MP_Normal, FColor(128, 128, 255, 255), false, Normal) ||
-			!GetProperty(MP_EmissiveColor, FColor::Black, true, Emission) ||
-			!GetProperty(Material->GetBlendMode() == BLEND_Masked ? MP_OpacityMask : MP_Opacity, FColor::White, false, Opacity))
+		if ((bNeedBaseColor && !GetProperty(MP_BaseColor, FColor::White, true, BaseColor)) ||
+			(bNeedOpacity && !GetProperty(OpacityProperty, FColor::White, false, Opacity)))
 		{
 			OutError = FString::Printf(TEXT("Material bake failed for slot %d (%s)."), SlotIndex, *Material->GetName());
 			return false;
 		}
+		if (bNeedBaseColor && bNeedOpacity)
+		{
+			for (int32 PixelIndex = 0; PixelIndex < BaseColor.Num() && PixelIndex < Opacity.Num(); ++PixelIndex)
+			{
+				BaseColor[PixelIndex].A = Opacity[PixelIndex].R;
+			}
+		}
+		if (bNeedBaseColor)
+		{
+			SaveMap(TEXT("BaseColor"), MoveTemp(BaseColor));
+		}
+		BaseColor.Reset();
+		if (IsMapSelected(SelectedMaps, TEXT("Opacity")))
+		{
+			for (FColor& Pixel : Opacity)
+			{
+				Pixel.G = Pixel.R;
+				Pixel.B = Pixel.R;
+				Pixel.A = Pixel.R;
+			}
+			SaveMap(GetOpacityMapName(Material), MoveTemp(Opacity));
+		}
+		Opacity.Reset();
+		ReleaseBakedProperty(MP_BaseColor);
+		ReleaseBakedProperty(OpacityProperty);
 
 		TArray<FColor> Metallic;
 		TArray<FColor> AmbientOcclusion;
 		TArray<FColor> Roughness;
-		if (!GetProperty(MP_Metallic, FColor::Black, false, Metallic) ||
-			!GetProperty(MP_AmbientOcclusion, FColor::White, false, AmbientOcclusion) ||
-			!GetProperty(MP_Roughness, FColor(128, 128, 128, 255), false, Roughness))
+		const bool bNeedMask = IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Mask);
+		const bool bNeedOcclusion = IsFBXExporterTextureMapEnabled(SelectedMaps, EFBXExporterTextureMap::Occlusion);
+		if ((bNeedMask && !GetProperty(MP_Metallic, FColor::Black, false, Metallic)) ||
+			((bNeedMask || bNeedOcclusion) && !GetProperty(MP_AmbientOcclusion, FColor::White, false, AmbientOcclusion)) ||
+			(bNeedMask && !GetProperty(MP_Roughness, FColor(128, 128, 128, 255), false, Roughness)))
 		{
 			OutError = FString::Printf(TEXT("Scalar material bake failed for slot %d (%s)."), SlotIndex, *Material->GetName());
 			return false;
 		}
-
-		// Preserve opacity in BaseColor alpha and also export its standalone map so
-		// the manually authored Unity material can choose the desired alpha workflow.
-		for (int32 PixelIndex = 0; PixelIndex < BaseColor.Num() && PixelIndex < Opacity.Num(); ++PixelIndex)
+		TArray<FColor> Mask;
+		if (bNeedMask)
 		{
-			BaseColor[PixelIndex].A = Opacity[PixelIndex].R;
+			BuildMaskPixels(Metallic, AmbientOcclusion, Roughness, Options.BakeResolution, Options.BakeResolution, Mask);
+		}
+		if (bNeedMask)
+		{
+			SaveMap(TEXT("Mask"), MoveTemp(Mask));
+		}
+		if (bNeedOcclusion)
+		{
+			SaveMap(TEXT("Occlusion"), MoveTemp(AmbientOcclusion));
+		}
+		Mask.Reset();
+		AmbientOcclusion.Reset();
+		Metallic.Reset();
+		Roughness.Reset();
+		ReleaseBakedProperty(MP_Metallic);
+		ReleaseBakedProperty(MP_AmbientOcclusion);
+		ReleaseBakedProperty(MP_Roughness);
+
+		// Normal is independent of the color/scalar groups and can be discarded as
+		// soon as its selected output has been captured.
+		if (bNeedNormal)
+		{
+			TArray<FColor> Normal;
+			if (!GetProperty(MP_Normal, FColor(128, 128, 255, 255), false, Normal))
+			{
+				OutError = FString::Printf(TEXT("Normal material bake failed for slot %d (%s)."), SlotIndex, *Material->GetName());
+				return false;
+			}
+			SaveMap(TEXT("Normal"), MoveTemp(Normal));
+			Normal.Reset();
+			ReleaseBakedProperty(MP_Normal);
 		}
 
-		TArray<FColor> Mask;
-		BuildMaskPixels(Metallic, AmbientOcclusion, Roughness, Options.BakeResolution, Options.BakeResolution, Mask);
-
-		auto SaveMap = [&](const FString& MapName, const TArray<FColor>& Pixels)
+		// Emission is baked in linear space and explicitly encoded as sRGB before
+		// the PNG is staged.  Keep its scale alongside the material metadata.
+		if (bNeedEmission)
 		{
-			OutMaterialData.MapPixels.Add(MapName, Pixels);
-		};
-
-		SaveMap(TEXT("BaseColor"), BaseColor);
-		SaveMap(TEXT("Normal"), Normal);
-		SaveMap(TEXT("Mask"), Mask);
-		SaveMap(TEXT("Occlusion"), AmbientOcclusion);
-		SaveMap(TEXT("Emission"), Emission);
-		SaveMap(Material->GetBlendMode() == BLEND_Masked ? TEXT("OpacityMask") : TEXT("Opacity"), Opacity);
+			TArray<FColor> Emission;
+			if (!GetProperty(MP_EmissiveColor, FColor::Black, true, Emission))
+			{
+				OutError = FString::Printf(TEXT("Emission material bake failed for slot %d (%s)."), SlotIndex, *Material->GetName());
+				return false;
+			}
+			if (!DirectTextures.Contains(MP_EmissiveColor))
+			{
+				OutMaterialData.EmissionScale = BakeOutput.EmissiveScale > 0.0f ? BakeOutput.EmissiveScale : 1.0f;
+				for (FColor& Pixel : Emission)
+				{
+					const FLinearColor LinearColor(
+						static_cast<float>(Pixel.R) / 255.0f,
+						static_cast<float>(Pixel.G) / 255.0f,
+						static_cast<float>(Pixel.B) / 255.0f,
+						static_cast<float>(Pixel.A) / 255.0f);
+					Pixel = LinearColor.ToFColorSRGB();
+				}
+			}
+			SaveMap(TEXT("Emission"), MoveTemp(Emission));
+			Emission.Reset();
+		}
+		ReleaseBakedProperty(MP_EmissiveColor);
 
 		return true;
 	}
@@ -501,72 +947,365 @@ namespace
 			RelativePath.RemoveFromStart(TEXT("/"));
 			RelativePath.RemoveFromStart(TEXT("\\"));
 			const FString DestinationPath = FinalDirectory / RelativePath;
-			bSuccess &= IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationPath), true);
-			bSuccess &= IFileManager::Get().Move(*DestinationPath, *BackupFile, true, true);
+			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationPath), true) ||
+				!IFileManager::Get().Move(*DestinationPath, *BackupFile, true, true))
+			{
+				bSuccess = false;
+			}
 		}
 		return bSuccess;
 	}
 
-	bool CopyStagedFiles(
+	bool PublishStagedDirectory(
 		const FString& StagingDirectory,
 		const FString& FinalDirectory,
 		FString& OutError)
 	{
-		const FString BackupDirectory = StagingDirectory + TEXT("_Previous");
-		auto RestoreAndCleanupBackup = [&BackupDirectory, &FinalDirectory]()
+		if (!IFileManager::Get().DirectoryExists(*StagingDirectory))
 		{
-			const bool bRestored = RestorePreviousFiles(BackupDirectory, FinalDirectory);
-			if (bRestored)
-			{
-				IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true);
-			}
-			return bRestored;
-		};
-		TArray<FString> StagedFiles;
-		IFileManager::Get().FindFilesRecursive(StagedFiles, *StagingDirectory, TEXT("*"), true, false);
+			OutError = FString::Printf(TEXT("Staging directory does not exist: %s"), *StagingDirectory);
+			return false;
+		}
 
-		for (const FString& StagedFile : StagedFiles)
+		const FString StagingRoot = FPaths::ConvertRelativePathToFull(StagingDirectory);
+		const FString FinalRoot = FPaths::ConvertRelativePathToFull(FinalDirectory);
+		const FString BackupDirectory = StagingRoot + TEXT("_Previous");
+		const bool bHadFinalDirectory = IFileManager::Get().DirectoryExists(*FinalRoot);
+		if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
+			!IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true))
 		{
-			FString RelativePath = StagedFile.Mid(StagingDirectory.Len());
-			RelativePath.RemoveFromStart(TEXT("/"));
-			RelativePath.RemoveFromStart(TEXT("\\"));
-			const FString DestinationPath = FinalDirectory / RelativePath;
-			if (IFileManager::Get().FileExists(*DestinationPath))
+			OutError = FString::Printf(TEXT("Could not remove the previous staging backup: %s"), *BackupDirectory);
+			return false;
+		}
+
+		auto NormalizeDirectory = [](FString Path)
+		{
+			Path = FPaths::ConvertRelativePathToFull(Path);
+			FPaths::NormalizeDirectoryName(Path);
+			return Path.ToLower();
+		};
+		auto RelativeTo = [](FString Path, const FString& Root)
+		{
+			Path = FPaths::ConvertRelativePathToFull(Path);
+			// FPaths::MakePathRelativeTo interprets its second argument as a file
+			// path and strips that file's leaf.  Pass a synthetic child so Root is
+			// treated as the directory itself; otherwise every relative path would
+			// retain the final-directory name (e.g. Final/new.txt).
+			FPaths::MakePathRelativeTo(Path, *(Root / TEXT("_FBXExporterRoot")));
+			Path.RemoveFromStart(TEXT("./"));
+			Path.RemoveFromStart(TEXT(".\\"));
+			return Path;
+		};
+
+		TArray<FString> ExistingDirectories;
+		TSet<FString> OriginalDirectoryNames;
+		if (bHadFinalDirectory)
+		{
+			IFileManager::Get().FindFilesRecursive(ExistingDirectories, *FinalRoot, TEXT("*"), false, true);
+			for (const FString& ExistingDirectory : ExistingDirectories)
 			{
-				const FString BackupPath = BackupDirectory / RelativePath;
-				if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(BackupPath), true) ||
-					!IFileManager::Get().Move(*BackupPath, *DestinationPath, true, true))
+				OriginalDirectoryNames.Add(NormalizeDirectory(ExistingDirectory));
+			}
+		}
+		TArray<FString> ExistingFiles;
+		if (bHadFinalDirectory)
+		{
+			IFileManager::Get().FindFilesRecursive(ExistingFiles, *FinalRoot, TEXT("*"), true, false);
+		}
+		for (const FString& ExistingFile : ExistingFiles)
+		{
+			const FString RelativePath = RelativeTo(ExistingFile, FinalRoot);
+			if (RelativePath.IsEmpty() || RelativePath == TEXT("..") || RelativePath.StartsWith(TEXT("../")) || RelativePath.StartsWith(TEXT("..\\")))
+			{
+				OutError = FString::Printf(TEXT("Existing output path is outside the final directory: %s"), *ExistingFile);
+				return false;
+			}
+			const FString BackupPath = BackupDirectory / RelativePath;
+			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(BackupPath), true) ||
+				!IFileManager::Get().Move(*BackupPath, *ExistingFile, true, true))
+			{
+				OutError = FString::Printf(TEXT("Failed to back up the existing output file: %s"), *ExistingFile);
+				const bool bRestored = RestorePreviousFiles(BackupDirectory, FinalRoot);
+				if (bRestored && (!IFileManager::Get().DirectoryExists(*BackupDirectory) ||
+					IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true)))
 				{
-					RestoreAndCleanupBackup();
-					OutError = FString::Printf(TEXT("Failed to stage the existing output file: %s"), *DestinationPath);
-					return false;
+					// The output was restored and the temporary backup was removed.
 				}
+				else
+				{
+					OutError += FString::Printf(TEXT(" Existing output could not be fully restored. Preserve staging at '%s' and backup at '%s'."), *StagingRoot, *BackupDirectory);
+				}
+				return false;
 			}
 		}
 
+		TArray<FString> StagedFiles;
+		IFileManager::Get().FindFilesRecursive(StagedFiles, *StagingRoot, TEXT("*"), true, false);
 		TArray<FString> PublishedFiles;
+		auto CleanupUnexpectedDirectories = [&]()
+		{
+			if (!IFileManager::Get().DirectoryExists(*FinalRoot))
+			{
+				return true;
+			}
+			TArray<FString> CurrentDirectories;
+			IFileManager::Get().FindFilesRecursive(CurrentDirectories, *FinalRoot, TEXT("*"), false, true);
+			CurrentDirectories.Sort([](const FString& A, const FString& B)
+			{
+				return A.Len() > B.Len();
+			});
+			bool bSuccess = true;
+			for (const FString& CurrentDirectory : CurrentDirectories)
+			{
+				if (!OriginalDirectoryNames.Contains(NormalizeDirectory(CurrentDirectory)) &&
+					!IFileManager::Get().DeleteDirectory(*CurrentDirectory, false, false))
+				{
+					bSuccess = false;
+				}
+			}
+			return bSuccess;
+		};
+		auto RestoreAndCleanupBackup = [&]()
+		{
+			bool bDeletedPublishedFiles = true;
+			for (const FString& PublishedFile : PublishedFiles)
+			{
+				if (IFileManager::Get().FileExists(*PublishedFile) &&
+					!IFileManager::Get().Delete(*PublishedFile, false, true, true))
+				{
+					bDeletedPublishedFiles = false;
+				}
+			}
+			const bool bCleanedDirectories = CleanupUnexpectedDirectories();
+			const bool bRestored = RestorePreviousFiles(BackupDirectory, FinalRoot);
+			bool bRecreatedDirectories = true;
+			if (bRestored && bCleanedDirectories)
+			{
+				for (const FString& ExistingDirectory : ExistingDirectories)
+				{
+					if (!IFileManager::Get().MakeDirectory(*ExistingDirectory, true))
+					{
+						bRecreatedDirectories = false;
+					}
+				}
+				if (!bHadFinalDirectory)
+				{
+					bRecreatedDirectories = IFileManager::Get().DeleteDirectory(*FinalRoot, false, true) && bRecreatedDirectories;
+				}
+			}
+			if (!bRestored || !bCleanedDirectories || !bDeletedPublishedFiles || !bRecreatedDirectories)
+			{
+				OutError += FString::Printf(TEXT(" Existing output could not be fully restored%s%s%s. Preserve staging at '%s' and backup at '%s'."),
+					bDeletedPublishedFiles ? TEXT("") : TEXT(" or generated files could not be removed"),
+					bCleanedDirectories ? TEXT("") : TEXT(" or stale directories could not be removed"),
+					bRecreatedDirectories ? TEXT("") : TEXT(" or original directories could not be recreated"),
+					*StagingRoot, *BackupDirectory);
+				return false;
+			}
+			if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
+				!IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true))
+			{
+				OutError += FString::Printf(TEXT(" Previous output was restored, but backup cleanup failed. Preserve staging at '%s' and backup at '%s'."), *StagingRoot, *BackupDirectory);
+				return false;
+			}
+			return true;
+		};
+
 		for (const FString& StagedFile : StagedFiles)
 		{
-			FString RelativePath = StagedFile.Mid(StagingDirectory.Len());
-			RelativePath.RemoveFromStart(TEXT("/"));
-			RelativePath.RemoveFromStart(TEXT("\\"));
-			const FString DestinationPath = FinalDirectory / RelativePath;
+			const FString RelativePath = RelativeTo(StagedFile, StagingRoot);
+			if (RelativePath.IsEmpty() || RelativePath == TEXT("..") || RelativePath.StartsWith(TEXT("../")) || RelativePath.StartsWith(TEXT("..\\")))
+			{
+				OutError = FString::Printf(TEXT("Staged output path is outside the staging directory: %s"), *StagedFile);
+				RestoreAndCleanupBackup();
+				return false;
+			}
+			const FString DestinationPath = FinalRoot / RelativePath;
+			PublishedFiles.Add(DestinationPath);
 			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationPath), true) ||
 				IFileManager::Get().Copy(*DestinationPath, *StagedFile, true, true) != COPY_OK)
 			{
 				OutError = FString::Printf(TEXT("Failed to publish generated file: %s"), *DestinationPath);
-				for (const FString& PublishedFile : PublishedFiles)
-				{
-					IFileManager::Get().Delete(*PublishedFile, false, true, true);
-				}
 				RestoreAndCleanupBackup();
 				return false;
 			}
-			PublishedFiles.Add(DestinationPath);
 		}
 
-		IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true);
+		TSet<FString> RequiredDirectories;
+		RequiredDirectories.Add(NormalizeDirectory(FinalRoot));
+		for (const FString& StagedFile : StagedFiles)
+		{
+			const FString RelativePath = RelativeTo(StagedFile, StagingRoot);
+			FString RequiredDirectory = FPaths::GetPath(FinalRoot / RelativePath);
+			while (!RequiredDirectory.IsEmpty())
+			{
+				RequiredDirectories.Add(NormalizeDirectory(RequiredDirectory));
+				if (NormalizeDirectory(RequiredDirectory) == NormalizeDirectory(FinalRoot))
+				{
+					break;
+				}
+				const FString ParentDirectory = FPaths::GetPath(RequiredDirectory);
+				if (ParentDirectory == RequiredDirectory)
+				{
+					break;
+				}
+				RequiredDirectory = ParentDirectory;
+			}
+		}
+		TArray<FString> CurrentDirectories;
+		IFileManager::Get().FindFilesRecursive(CurrentDirectories, *FinalRoot, TEXT("*"), false, true);
+		CurrentDirectories.Sort([](const FString& A, const FString& B)
+		{
+			return A.Len() > B.Len();
+		});
+		for (const FString& CurrentDirectory : CurrentDirectories)
+		{
+			if (!RequiredDirectories.Contains(NormalizeDirectory(CurrentDirectory)) &&
+				!IFileManager::Get().DeleteDirectory(*CurrentDirectory, false, false))
+			{
+				OutError = FString::Printf(TEXT("Failed to remove stale output directory: %s"), *CurrentDirectory);
+				RestoreAndCleanupBackup();
+				return false;
+			}
+		}
+
+		// Anything not present in the staging tree is intentionally removed when
+		// the backup is discarded. This makes the mesh folder plugin-owned while
+		// retaining a complete backup until all publish steps have succeeded.
+		if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
+			!IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true))
+		{
+			OutError = FString::Printf(TEXT("Failed to remove the previous output backup: %s"), *BackupDirectory);
+			RestoreAndCleanupBackup();
+			return false;
+		}
 		return true;
+	}
+
+	bool SaveMetadataJson(
+		const FString& JsonPath,
+		const FString& SourceStaticMesh,
+		const FString& FinalFbxPath,
+		const FFBXExporterOptions& Options,
+		const TArray<FFBXExporterSlotData>& Slots,
+		const TArray<FFBXExporterMaterialBinding>& Bindings,
+		FString& OutError)
+	{
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetNumberField(TEXT("schemaVersion"), 1);
+		Root->SetStringField(TEXT("sourceStaticMesh"), SourceStaticMesh);
+		Root->SetStringField(TEXT("fbxFile"), FPaths::ConvertRelativePathToFull(FinalFbxPath));
+		Root->SetNumberField(TEXT("bakeResolution"), Options.BakeResolution);
+		TArray<TSharedPtr<FJsonValue>> SelectedMapValues;
+		for (const FString& Name : GetTextureMapNames())
+		{
+			if (IsMapSelected(Options.TextureMaps, Name))
+			{
+				SelectedMapValues.Add(MakeShared<FJsonValueString>(Name));
+			}
+		}
+		Root->SetArrayField(TEXT("selectedMaps"), MoveTemp(SelectedMapValues));
+		Root->SetBoolField(TEXT("texturesEmbedded"), Options.bEmbedTexturesInFbx && Options.TextureMaps != EFBXExporterTextureMap::None);
+		Root->SetStringField(TEXT("maskLayout"), TEXT("R=Metallic;G=AO;B=Reserved;A=Smoothness(1-Roughness)"));
+		Root->SetStringField(TEXT("opacityConvention"), TEXT("1=Opaque"));
+
+		TArray<TSharedPtr<FJsonValue>> MaterialValues;
+		for (const FFBXExporterMaterialBinding& Binding : Bindings)
+		{
+			TSharedRef<FJsonObject> MaterialObject = MakeShared<FJsonObject>();
+			MaterialObject->SetNumberField(TEXT("fbxMaterialIndex"), Binding.FbxMaterialIndex);
+			TArray<TSharedPtr<FJsonValue>> SourceSlots;
+			for (const int32 SlotIndex : Binding.SourceSlotIndices)
+			{
+				if (!Slots.IsValidIndex(SlotIndex)) continue;
+				TSharedRef<FJsonObject> SlotObject = MakeShared<FJsonObject>();
+				SlotObject->SetNumberField(TEXT("slotIndex"), SlotIndex);
+				SlotObject->SetStringField(TEXT("slotName"), Slots[SlotIndex].SlotName);
+				SourceSlots.Add(MakeShared<FJsonValueObject>(SlotObject));
+			}
+			MaterialObject->SetArrayField(TEXT("sourceSlots"), MoveTemp(SourceSlots));
+			if (Binding.MaterialPath.IsEmpty())
+			{
+				MaterialObject->SetField(TEXT("materialPath"), MakeShared<FJsonValueNull>());
+			}
+			else
+			{
+				MaterialObject->SetStringField(TEXT("materialPath"), Binding.MaterialPath);
+			}
+			MaterialObject->SetStringField(TEXT("blendMode"), Binding.BlendMode);
+			MaterialObject->SetStringField(TEXT("baseColorAlpha"), Binding.BaseColorAlpha);
+			MaterialObject->SetNumberField(TEXT("emissionScale"), Binding.EmissionScale);
+			TArray<TSharedPtr<FJsonValue>> Maps;
+			TArray<FString> SortedMapNames;
+			Binding.MapRelativePaths.GetKeys(SortedMapNames);
+			SortedMapNames.Sort();
+			for (const FString& MapName : SortedMapNames)
+			{
+				const FString& RelativePath = Binding.MapRelativePaths[MapName];
+				TSharedRef<FJsonObject> MapObject = MakeShared<FJsonObject>();
+				MapObject->SetStringField(TEXT("map"), MapName);
+				MapObject->SetStringField(TEXT("file"), RelativePath);
+				const bool bSRGB = MapName == TEXT("BaseColor") || MapName == TEXT("Emission");
+				MapObject->SetStringField(TEXT("colorSpace"), bSRGB ? TEXT("sRGB") : TEXT("Linear"));
+				Maps.Add(MakeShared<FJsonValueObject>(MapObject));
+			}
+			MaterialObject->SetArrayField(TEXT("maps"), MoveTemp(Maps));
+			MaterialValues.Add(MakeShared<FJsonValueObject>(MaterialObject));
+		}
+		Root->SetArrayField(TEXT("materials"), MoveTemp(MaterialValues));
+
+		FString JsonString;
+		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);
+		if (!FJsonSerializer::Serialize(Root, Writer) || !FFileHelper::SaveStringToFile(JsonString, *JsonPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			OutError = FString::Printf(TEXT("Failed to write material metadata: %s"), *JsonPath);
+			return false;
+		}
+		return true;
+	}
+
+	void BuildSlotNames(UStaticMesh* StaticMesh, TArray<FFBXExporterSlotData>& OutSlots)
+	{
+		OutSlots.Reset();
+		const TArray<FStaticMaterial>& StaticMaterials = StaticMesh->GetStaticMaterials();
+		TSet<FString> UsedNames;
+		TArray<FString> CandidateNames;
+		for (int32 SlotIndex = 0; SlotIndex < StaticMaterials.Num(); ++SlotIndex)
+		{
+			const FString RawName = StaticMaterials[SlotIndex].MaterialSlotName.IsNone()
+				? FString::Printf(TEXT("Slot_%d"), SlotIndex)
+				: StaticMaterials[SlotIndex].MaterialSlotName.ToString();
+			CandidateNames.Add(MakeSafeFileName(RawName));
+		}
+		for (int32 SlotIndex = 0; SlotIndex < CandidateNames.Num(); ++SlotIndex)
+		{
+			FString SafeName = CandidateNames[SlotIndex];
+			FString LowerName = SafeName.ToLower();
+			if (UsedNames.Contains(LowerName) || CandidateNames.FilterByPredicate([&SafeName](const FString& Other)
+			{
+				return Other.Equals(SafeName, ESearchCase::IgnoreCase);
+			}).Num() > 1)
+			{
+				SafeName += FString::Printf(TEXT("_Slot%d"), SlotIndex);
+				int32 Suffix = 0;
+				while (UsedNames.Contains(SafeName.ToLower()))
+				{
+					SafeName = FString::Printf(TEXT("%s_%d"), *SafeName, ++Suffix);
+				}
+			}
+			UsedNames.Add(SafeName.ToLower());
+			FFBXExporterSlotData Slot;
+			Slot.SlotIndex = SlotIndex;
+			Slot.SlotName = SafeName;
+			Slot.bHasMaterial = StaticMesh->GetMaterial(SlotIndex) != nullptr;
+			if (UMaterialInterface* Material = StaticMesh->GetMaterial(SlotIndex))
+			{
+				Slot.MaterialPath = Material->GetPathName();
+				Slot.BlendMode = GetBlendModeName(Material);
+				Slot.BaseColorAlpha = GetOpacityMapName(Material);
+			}
+			OutSlots.Add(MoveTemp(Slot));
+		}
 	}
 
 	FFBXExporterResult ExportStaticMesh(UStaticMesh* StaticMesh, const FFBXExporterOptions& Options)
@@ -582,10 +1321,21 @@ namespace
 			Result.Errors.Add(FString::Printf(TEXT("Static Mesh has no valid LOD0 render data: %s"), *StaticMesh->GetPathName()));
 			return Result;
 		}
-
 		if (Options.OutputRoot.IsEmpty())
 		{
 			Result.Errors.Add(TEXT("Output folder is empty."));
+			return Result;
+		}
+		if (Options.TextureMaps != EFBXExporterTextureMap::None &&
+			(Options.BakeResolution <= 0 || Options.BakeResolution > 16384))
+		{
+			Result.Errors.Add(TEXT("Bake resolution must be between 1 and 16384 pixels."));
+			return Result;
+		}
+		const uint8 KnownTextureMapBits = static_cast<uint8>(EFBXExporterTextureMap::All);
+		if ((static_cast<uint8>(Options.TextureMaps) & static_cast<uint8>(~KnownTextureMapBits)) != 0)
+		{
+			Result.Errors.Add(TEXT("TextureMaps contains unsupported map bits."));
 			return Result;
 		}
 
@@ -596,14 +1346,13 @@ namespace
 			const EAppReturnType::Type OverwriteChoice = FMessageDialog::Open(
 				EAppMsgType::YesNo,
 				FText::Format(
-					LOCTEXT("OverwriteExistingMeshFolder", "The static mesh export folder already exists for {0}. Replace the FBX and matching texture files?"),
+					LOCTEXT("OverwriteExistingMeshFolder", "The entire export folder for {0}, including user files, will be replaced. Continue?"),
 					FText::FromString(StaticMesh->GetName())));
 			if (OverwriteChoice != EAppReturnType::Yes)
 			{
 				return Result;
 			}
 		}
-
 		if (!IFileManager::Get().MakeDirectory(*Options.OutputRoot, true))
 		{
 			Result.Errors.Add(FString::Printf(TEXT("Failed to create output root: %s"), *Options.OutputRoot));
@@ -611,68 +1360,131 @@ namespace
 		}
 
 		const FString StagingDirectory = Options.OutputRoot / (TEXT(".FBX_Exporter_") + FGuid::NewGuid().ToString(EGuidFormats::Digits));
-		IFileManager::Get().MakeDirectory(*StagingDirectory, true);
-		const auto CleanupStaging = [&StagingDirectory]()
+		if (!IFileManager::Get().MakeDirectory(*StagingDirectory, true))
 		{
+			Result.Errors.Add(FString::Printf(TEXT("Failed to create staging directory: %s"), *StagingDirectory));
+			return Result;
+		}
+		bool bKeepBackup = false;
+		const auto CleanupStaging = [&StagingDirectory, &bKeepBackup]()
+		{
+			if (bKeepBackup)
+			{
+				return;
+			}
 			IFileManager::Get().DeleteDirectory(*StagingDirectory, false, true);
 			IFileManager::Get().DeleteDirectory(*(StagingDirectory + TEXT("_Previous")), false, true);
 		};
 
-		const FString FbxPath = StagingDirectory / (MeshName + TEXT(".fbx"));
+		TArray<FFBXExporterSlotData> Slots;
+		BuildSlotNames(StaticMesh, Slots);
+		const FString StagedFbxPath = StagingDirectory / (MeshName + TEXT(".fbx"));
+		const FString FinalFbxPath = FinalDirectory / (MeshName + TEXT(".fbx"));
 		FString Error;
-		if (!ExportFbx(StaticMesh, FbxPath, Error))
+		if (!ExportFbx(StaticMesh, StagedFbxPath, Error))
 		{
 			Result.Errors.Add(Error);
 			CleanupStaging();
 			return Result;
 		}
 
-		const TArray<FStaticMaterial>& StaticMaterials = StaticMesh->GetStaticMaterials();
-		for (int32 SlotIndex = 0; SlotIndex < StaticMaterials.Num(); ++SlotIndex)
+		TArray<FFBXExporterTextureFileData> TextureFiles;
+		if (Options.TextureMaps != EFBXExporterTextureMap::None)
 		{
-			const FName SlotName = StaticMaterials[SlotIndex].MaterialSlotName.IsNone()
-				? FName(*FString::Printf(TEXT("Slot_%d"), SlotIndex))
-				: StaticMaterials[SlotIndex].MaterialSlotName;
-
-			UMaterialInterface* Material = StaticMesh->GetMaterial(SlotIndex);
-			if (!Material)
+			for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
 			{
-				Result.Warnings.Add(FString::Printf(TEXT("Material slot %d has no assigned material; no textures were generated."), SlotIndex));
-				continue;
-			}
-
-			FBakedMaterialData MaterialData;
-			if (!BakeMaterial(StaticMesh, SlotIndex, Material, Options, MaterialData, Error))
-			{
-				Result.Errors.Add(Error);
-				CleanupStaging();
-				return Result;
-			}
-
-			for (const TPair<FString, TArray<FColor>>& MapPair : MaterialData.MapPixels)
-			{
-				const bool bSRGB = MapPair.Key == TEXT("BaseColor") || MapPair.Key == TEXT("Emission");
-				const FString MaterialName = SlotName.IsNone() ? FString::Printf(TEXT("Slot_%d"), SlotIndex) : SlotName.ToString();
-				const FString AbsolutePath = StagingDirectory / TEXT("Textures") / GetMapFileName(MaterialName, MapPair.Key);
-				if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(AbsolutePath), true) ||
-					!SaveImage(AbsolutePath, MapPair.Value, Options.BakeResolution, Options.BakeResolution, bSRGB, Error))
+				UMaterialInterface* Material = StaticMesh->GetMaterial(SlotIndex);
+				if (!Material)
+				{
+					Result.Warnings.Add(FString::Printf(TEXT("Material slot %d has no assigned material; no textures were generated."), SlotIndex));
+					continue;
+				}
+				FBakedMaterialData MaterialData;
+				if (!BakeMaterial(StaticMesh, SlotIndex, Material, Options, MaterialData, Error))
 				{
 					Result.Errors.Add(Error);
 					CleanupStaging();
 					return Result;
 				}
+				Slots[SlotIndex].EmissionScale = MaterialData.EmissionScale;
+				TArray<FString> SortedMapNames;
+				MaterialData.MapPixels.GetKeys(SortedMapNames);
+				SortedMapNames.Sort();
+				for (const FString& MapName : SortedMapNames)
+				{
+					const TArray<FColor>* MapPixels = MaterialData.MapPixels.Find(MapName);
+					if (!MapPixels)
+					{
+						Result.Errors.Add(FString::Printf(TEXT("Missing generated pixel data for map %s."), *MapName));
+						CleanupStaging();
+						return Result;
+					}
+					const bool bSRGB = MapName == TEXT("BaseColor") || MapName == TEXT("Emission");
+					FString RelativePath = FPaths::Combine(TEXT("Textures"), GetMapFileName(Slots[SlotIndex].SlotName, MapName));
+					RelativePath.ReplaceInline(TEXT("\\"), TEXT("/"));
+					const FString AbsolutePath = StagingDirectory / RelativePath;
+					if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(AbsolutePath), true) ||
+						!SaveImage(AbsolutePath, *MapPixels, Options.BakeResolution, Options.BakeResolution, bSRGB, Error))
+					{
+						Result.Errors.Add(Error);
+						CleanupStaging();
+						return Result;
+					}
+					FFBXExporterTextureFileData TextureFile;
+					TextureFile.MapName = MapName;
+					TextureFile.RelativePath = RelativePath;
+					TextureFile.StagedAbsolutePath = AbsolutePath;
+					TextureFile.FinalAbsolutePath = FinalDirectory / RelativePath;
+					TextureFile.ColorSpace = bSRGB ? TEXT("sRGB") : TEXT("Linear");
+					if (!FFileHelper::LoadFileToArray(TextureFile.FileBytes, *AbsolutePath))
+					{
+						Result.Errors.Add(FString::Printf(TEXT("Failed to read generated texture: %s"), *AbsolutePath));
+						CleanupStaging();
+						return Result;
+					}
+					Slots[SlotIndex].MapRelativePaths.Add(MapName, RelativePath);
+					TextureFiles.Add(MoveTemp(TextureFile));
+				}
+				Result.Warnings.Append(MaterialData.Warnings);
 			}
-
-			Result.Warnings.Append(MaterialData.Warnings);
 		}
 
-		if (!CopyStagedFiles(StagingDirectory, FinalDirectory, Error))
+		TArray<FFBXExporterSectionData> Sections;
+		const FStaticMeshLODResources& LOD0 = StaticMesh->GetRenderData()->LODResources[0];
+		for (const FStaticMeshSection& Section : LOD0.Sections)
+		{
+			FFBXExporterSectionData SectionData;
+			SectionData.SlotIndex = Section.MaterialIndex;
+			SectionData.TriangleCount = Section.NumTriangles;
+			SectionData.bHasMaterial = Slots.IsValidIndex(Section.MaterialIndex) && Slots[Section.MaterialIndex].bHasMaterial;
+			Sections.Add(SectionData);
+		}
+		TArray<FFBXExporterMaterialBinding> Bindings;
+		if (!FBXExporter::PostProcessFbx(StagedFbxPath, FinalFbxPath, Sections, Slots, TextureFiles,
+			Options.bEmbedTexturesInFbx && Options.TextureMaps != EFBXExporterTextureMap::None, Bindings, Error))
 		{
 			Result.Errors.Add(Error);
 			CleanupStaging();
 			return Result;
 		}
+		if (Options.TextureMaps != EFBXExporterTextureMap::None)
+		{
+			const FString JsonPath = StagingDirectory / (MeshName + TEXT("_Materials.json"));
+			if (!SaveMetadataJson(JsonPath, StaticMesh->GetPathName(), FinalFbxPath, Options, Slots, Bindings, Error))
+			{
+				Result.Errors.Add(Error);
+				CleanupStaging();
+				return Result;
+			}
+		}
 
+		if (!PublishStagedDirectory(StagingDirectory, FinalDirectory, Error))
+		{
+			Result.Errors.Add(Error);
+			bKeepBackup = IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous")));
+			CleanupStaging();
+			return Result;
+		}
 		CleanupStaging();
 		Result.bSuccess = true;
 		Result.FinalDirectory = FinalDirectory;
@@ -728,7 +1540,8 @@ namespace
 			}
 
 			const FString MeshFolderName = MakeSafeFileName(StaticMesh->GetName());
-			if (MeshFolderNames.Contains(MeshFolderName))
+			const FString MeshFolderKey = MeshFolderName.ToLower();
+			if (MeshFolderNames.Contains(MeshFolderKey))
 			{
 				Summary.Errors.Add(FString::Printf(
 					TEXT("Multiple selected assets resolve to the same output folder '%s'. Rename one asset or export it separately."),
@@ -736,7 +1549,7 @@ namespace
 				continue;
 			}
 
-			MeshFolderNames.Add(MeshFolderName);
+			MeshFolderNames.Add(MeshFolderKey);
 			StaticMeshes.Add(StaticMesh);
 		}
 
@@ -787,7 +1600,7 @@ namespace Testing
 
 	bool PublishStagedFiles(const FString& StagingDirectory, const FString& FinalDirectory, FString& OutError)
 	{
-		return CopyStagedFiles(StagingDirectory, FinalDirectory, OutError);
+		return PublishStagedDirectory(StagingDirectory, FinalDirectory, OutError);
 	}
 }
 
@@ -803,7 +1616,12 @@ FString MakeSafeFileName(const FString& InName)
 			Result[Index] = TEXT('_');
 		}
 	}
-	return Result.IsEmpty() ? TEXT("Unnamed") : Result;
+	return Result.IsEmpty() || Result == TEXT(".") || Result == TEXT("..") ? TEXT("Unnamed") : Result;
+}
+
+EFBXExporterTextureMap GetRequiredTextureMapsForBake(const EFBXExporterTextureMap SelectedMaps)
+{
+	return GetRequiredBakeMaps(SelectedMaps);
 }
 
 void BuildMaskPixels(
@@ -814,6 +1632,11 @@ void BuildMaskPixels(
 	const int32 Height,
 	TArray<FColor>& OutPixels)
 {
+	if (Width <= 0 || Height <= 0)
+	{
+		OutPixels.Reset();
+		return;
+	}
 	const int32 PixelCount = Width * Height;
 	OutPixels.SetNum(PixelCount);
 
@@ -901,7 +1724,7 @@ void ShowExportDialog(const TArray<FAssetData>& SelectedAssets)
 
 	SAssignNew(Window, SWindow)
 		.Title(LOCTEXT("FBXExporterWindowTitle", "FBX_Exporter"))
-		.ClientSize(FVector2D(620.0f, 270.0f))
+		.ClientSize(FVector2D(720.0f, 500.0f))
 		.SupportsMaximize(false)
 		.SupportsMinimize(false);
 
@@ -992,11 +1815,135 @@ void ShowExportDialog(const TArray<FAssetData>& SelectedAssets)
 					SNew(STextBlock).Text(LOCTEXT("ReuseDirectTextures", "Reuse directly connected source textures when available"))
 				]
 			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 4.0f)
+			[
+				SNew(STextBlock).Text(LOCTEXT("TextureMapsLabel", "Texture maps"))
+			]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(SUniformGridPanel)
+				.SlotPadding(FMargin(4.0f, 2.0f))
+				+ SUniformGridPanel::Slot(0, 0)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::BaseColor) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::BaseColor;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::BaseColor));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("BaseColorMap", "Base Color"))
+					]
+				]
+				+ SUniformGridPanel::Slot(1, 0)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Normal) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Normal;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Normal));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("NormalMap", "Normal"))
+					]
+				]
+				+ SUniformGridPanel::Slot(2, 0)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Mask) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Mask;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Mask));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("MaskMap", "Mask"))
+					]
+				]
+				+ SUniformGridPanel::Slot(3, 0)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Occlusion) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Occlusion;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Occlusion));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("OcclusionMap", "Occlusion"))
+					]
+				]
+				+ SUniformGridPanel::Slot(0, 1)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Emission) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Emission;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Emission));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("EmissionMap", "Emission"))
+					]
+				]
+				+ SUniformGridPanel::Slot(1, 1)
+				[
+					SNew(SCheckBox)
+					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Opacity) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+					{
+						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Opacity;
+						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Opacity));
+					})
+					[
+						SNew(STextBlock).Text(LOCTEXT("OpacityMap", "Opacity / Opacity Mask"))
+					]
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 4.0f)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 8.0f, 0.0f)
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("SelectAllTextureMaps", "Select All"))
+					.OnClicked_Lambda([State]()
+					{
+						State->TextureMaps = EFBXExporterTextureMap::All;
+						return FReply::Handled();
+					})
+				]
+				+ SHorizontalBox::Slot().AutoWidth()
+				[
+					SNew(SButton)
+					.Text(LOCTEXT("ClearAllTextureMaps", "Clear All"))
+					.OnClicked_Lambda([State]()
+					{
+						State->TextureMaps = EFBXExporterTextureMap::None;
+						return FReply::Handled();
+					})
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
+			[
+				SNew(SCheckBox)
+				.IsChecked_Lambda([State]() { return State->bEmbedTexturesInFbx ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
+				.IsEnabled_Lambda([State]() { return State->TextureMaps != EFBXExporterTextureMap::None; })
+				.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
+				{
+					State->bEmbedTexturesInFbx = NewState == ECheckBoxState::Checked;
+				})
+				[
+					SNew(STextBlock).Text(LOCTEXT("EmbedTexturesInFbx", "Embed selected textures in FBX"))
+				]
+			]
 			+ SVerticalBox::Slot().FillHeight(1.0f)
 			[
 				SNew(STextBlock).Text(LOCTEXT(
 					"StaticMeshTextureExportDescription",
-					"The export creates only an FBX and a Textures folder. Create and assign Unity materials manually. The Unreal asset is not modified."))
+					"Selected maps are baked or directly reused from UV0. The export creates an FBX, selected PNGs under Textures, and a versioned material JSON file. The Unreal asset is not modified."))
 			]
 			+ SVerticalBox::Slot().AutoHeight()
 			[
@@ -1051,6 +1998,8 @@ void ShowExportDialog(const TArray<FAssetData>& SelectedAssets)
 	Options.OutputRoot = State->OutputRoot;
 	Options.BakeResolution = State->BakeResolution;
 	Options.bReuseDirectTextures = State->bReuseDirectTextures;
+	Options.TextureMaps = State->TextureMaps;
+	Options.bEmbedTexturesInFbx = State->bEmbedTexturesInFbx;
 	ExecuteExport(SelectedAssets, Options);
 }
 }

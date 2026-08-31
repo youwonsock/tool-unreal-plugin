@@ -11,6 +11,7 @@ namespace FBXExporter
 	void ShowExportDialog(const TArray<FAssetData>& SelectedAssets);
 
 	FString MakeSafeFileName(const FString& InName);
+	EFBXExporterTextureMap GetRequiredTextureMapsForBake(EFBXExporterTextureMap SelectedMaps);
 	void BuildMaskPixels(
 		const TArray<FColor>& Metallic,
 		const TArray<FColor>& AmbientOcclusion,
