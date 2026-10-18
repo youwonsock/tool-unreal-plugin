@@ -4,6 +4,68 @@
 #include "ImageCore.h"
 #include "Misc/AutomationTest.h"
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotPaddingRgbContractTest,
+    "CubeShot.Editor.Image.TransparentPaddingPreservesRGBA",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCubeShotPaddingRgbContractTest::RunTest(const FString&)
+{
+    FImage Source(10,8,ERawImageFormat::BGRA8,EGammaSpace::sRGB);auto Pixels=Source.AsBGRA8();
+    for(int32 Y=0;Y<8;++Y)for(int32 X=0;X<10;++X)Pixels[Y*10+X]=FColor(5+X*10,7+Y*20,137,0);
+    Pixels[3*10+4].A=255;Pixels[4*10+5].A=128;
+    FImage Output;FText Error;TestTrue(TEXT("Trim padded source"),CubeShot::Image::PrepareIconExport(Source,true,2,0,Output,Error));
+    TestEqual(TEXT("Padded width"),Output.SizeX,6);TestEqual(TEXT("Padded height"),Output.SizeY,6);
+    for(int32 Y=0;Y<6;++Y)for(int32 X=0;X<6;++X)
+        if(Output.AsBGRA8()[Y*6+X]!=Pixels[(Y+1)*10+X+2]){AddError(TEXT("Trim must preserve every source RGBA pixel, including nonzero RGB at alpha zero."));return false;}
+    FImage Rotated;TestTrue(TEXT("Rotate padded source"),CubeShot::Image::PrepareIconExport(Source,true,2,1,Rotated,Error));
+    for(int32 Y=0;Y<6;++Y)for(int32 X=0;X<6;++X)
+        if(Rotated.AsBGRA8()[X*6+5-Y]!=Output.AsBGRA8()[Y*6+X]){AddError(TEXT("Rotation changed a padded RGBA pixel."));return false;}
+    Pixels[3*10+4].A=Pixels[4*10+5].A=0;Pixels[0].A=255;
+    TestTrue(TEXT("Edge subject pads within original frame"),CubeShot::Image::PrepareIconExport(Source,true,3,0,Output,Error));
+    TestEqual(TEXT("Padding clamps at source left edge"),Output.SizeX,4);TestEqual(TEXT("Padding clamps at source top edge"),Output.SizeY,4);
+    for(int32 Y=0;Y<4;++Y)for(int32 X=0;X<4;++X)TestEqual(TEXT("Clamped padding preserves source RGBA"),Output.AsBGRA8()[Y*4+X],Pixels[Y*10+X]);
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotIconExportTest,
+    "CubeShot.Editor.Image.IconExportFraming",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCubeShotIconExportTest::RunTest(const FString& Parameters)
+{
+    FImage Source(9, 7, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+    for (FColor& Pixel : Source.AsBGRA8()) Pixel = FColor(19, 23, 31, 0);
+    // An asymmetric subject includes a faint antialiased edge that must not be discarded.
+    const FColor A(80, 20, 30, 255), B(20, 90, 40, 1), C(30, 40, 100, 127);
+    Source.AsBGRA8()[2 * 9 + 3] = A;
+    Source.AsBGRA8()[2 * 9 + 5] = B;
+    Source.AsBGRA8()[3 * 9 + 4] = C;
+    FText Error;
+    FImage Output;
+    TestTrue(TEXT("Default export succeeds"), CubeShot::Image::PrepareIconExport(Source, false, 8, 0, Output, Error));
+    TestTrue(TEXT("Default export preserves all bytes"), Output.RawData == Source.RawData);
+    TestTrue(TEXT("Trim with padding succeeds"), CubeShot::Image::PrepareIconExport(Source, true, 1, 0, Output, Error));
+    TestEqual(TEXT("Trimmed width includes both padded edges"), Output.SizeX, 5);
+    TestEqual(TEXT("Trimmed height includes both padded edges"), Output.SizeY, 4);
+    TestEqual(TEXT("Faint alpha is preserved"), Output.AsBGRA8()[1 * 5 + 3], B);
+    for (int32 Turn = 1; Turn <= 3; ++Turn)
+    {
+        FImage Rotated;
+        TestTrue(TEXT("Quarter turn succeeds"), CubeShot::Image::PrepareIconExport(Output, false, 0, Turn, Rotated, Error));
+        FImage Restored;
+        TestTrue(TEXT("Inverse quarter turn succeeds"), CubeShot::Image::PrepareIconExport(Rotated, false, 0, 4 - Turn, Restored, Error));
+        TestTrue(TEXT("Round trip preserves every color and alpha byte"), Restored.RawData == Output.RawData);
+    }
+    FImage Clockwise;
+    CubeShot::Image::PrepareIconExport(Output, false, 0, 1, Clockwise, Error);
+    TestEqual(TEXT("Clockwise export swaps width"), Clockwise.SizeX, 4);
+    TestEqual(TEXT("Clockwise export swaps height"), Clockwise.SizeY, 5);
+    TestEqual(TEXT("Clockwise mapping retains the subject orientation"), Clockwise.AsBGRA8()[1 * 4 + 2], A);
+    TestFalse(TEXT("Fractional rotations are not part of this API"), CubeShot::Image::PrepareIconExport(Source, true, 1, 4, Output, Error));
+    TestFalse(TEXT("Negative padding is rejected"), CubeShot::Image::PrepareIconExport(Source, true, -1, 0, Output, Error));
+    for (FColor& Pixel : Source.AsBGRA8()) Pixel.A = 0;
+    TestFalse(TEXT("An empty capture cannot be framed as a valid icon"), CubeShot::Image::PrepareIconExport(Source, true, 8, 0, Output, Error));
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FCubeShotInverseOpacityTest,
     "CubeShot.Editor.Image.InverseOpacity",

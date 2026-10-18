@@ -45,6 +45,11 @@ struct FFBXExporterMaterialBinding
 
 namespace FBXExporter
 {
+	namespace Testing
+	{
+		bool VerifyImportedMedia(const FString& FbxPath, bool bExpectEmbedded, int32 MinimumMaterials,
+			int32& TextureCount, FString& OutError);
+	}
 	bool PostProcessFbx(
 		const FString& StagedFbxPath,
 		const FString& FinalFbxPath,

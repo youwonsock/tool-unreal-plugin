@@ -6,7 +6,7 @@ Unreal Engine 5.8용 Editor 전용 플러그인입니다. Content Browser에서 
 
 - 여러 Static Mesh를 한 번에 내보냅니다.
 - 선택한 메시마다 별도의 폴더와 FBX 파일을 생성합니다.
-- 대화상자에서 `Base Color`, `Normal`, `Mask`, `Occlusion`, `Emission`, `Opacity/Opacity Mask`를 개별 선택할 수 있습니다. `Select All`/`Clear All`로 한 번에 변경할 수 있습니다.
+- 도킹 탭에서 `Base Color`, `Normal`, `Mask`, `Occlusion`, `Emission`, `Opacity/Opacity Mask`를 개별 선택할 수 있습니다. `Select All`/`Clear All`로 한 번에 변경할 수 있습니다.
 - 선택한 맵만 베이크·직접 재사용·FBX 연결·JSON에 기록합니다. 모든 맵을 해제하면 텍스처 참조가 없는 geometry-only FBX만 생성합니다.
 - `Embed selected textures in FBX`를 켜면 외부 PNG와 동일한 바이트를 FBX 미디어에 임베드합니다. 끄면 `Textures/...` 상대 경로로 연결합니다.
 - PBR 베이크 해상도 `512`, `1024`, `2048`, `4096`을 지원하며 기본값은 `2048`입니다.
@@ -14,6 +14,7 @@ Unreal Engine 5.8용 Editor 전용 플러그인입니다. Content Browser에서 
 - 마지막 출력 폴더를 프로젝트 설정에 저장하고 다음 실행 때 다시 사용합니다.
 - FBX SDK 2020.2 후처리로 LOD0 polygon material index를 검증해 머티리얼과 텍스처를 연결합니다.
 - 기존 메시 폴더를 덮어쓸 때 사용자 파일을 포함한 폴더 전체가 교체됨을 안내하며, 오류가 발생하면 기존 폴더와 백업을 보존하도록 임시 스테이징을 사용합니다.
+- 플러그인 자체에 MCP 도구를 포함합니다. 다른 프로젝트의 `Plugins/FBX_Exporter`로 옮겨도 해당 프로젝트의 메시 검색·사전 검사·추출을 사용할 수 있습니다. Haven, CubeShot, 프로젝트별 Python 스크립트에 의존하지 않습니다.
 
 Unreal 에셋 자체는 수정하지 않습니다. Unity 머티리얼, Unity 메타데이터, 머티리얼 설정 파일은 생성하지 않으므로 외부 툴에서 직접 구성해야 합니다.
 
@@ -37,6 +38,8 @@ Unreal 에셋 자체는 수정하지 않습니다. Unity 머티리얼, Unity 메
 
 메시가 Masked 블렌드 모드이면 마지막 파일 이름은 `OpacityMask.png`가 됩니다. `BaseColor`의 알파 채널에도 opacity 값이 기록됩니다.
 
+임베드를 켜면 PNG 파일 데이터가 FBX 내부에도 저장되며, 외부 `Textures` 폴더도 함께 생성됩니다. 외부 PNG는 임베드를 읽지 못하는 프로그램에서 사용하거나 직접 재연결·편집할 때 쓸 수 있습니다. 임베드를 끈 경우에는 FBX와 `Textures` 폴더를 함께 옮겨야 합니다. JSON은 맵·색 공간·재질 규칙을 기록하는 메타데이터이며, 일반적인 3D 프로그램이 자동으로 읽는 텍스처 연결 파일은 아닙니다. 실제 연결 정보는 FBX 안에 있습니다. 여기서 DCC(Digital Content Creation)는 Blender, Maya, 3ds Max 같은 3D 제작 프로그램을 뜻합니다.
+
 `Mask.png`의 채널은 다음과 같이 구성됩니다.
 
 | 채널 | 값 |
@@ -54,54 +57,86 @@ Unreal 에셋 자체는 수정하지 않습니다. Unity 머티리얼, Unity 메
 
 ## 설치 및 프로젝트 연결
 
-Haven 프로젝트에서 사용하는 플러그인은 다음 위치에 배치되어 있습니다.
+호환되는 UE 5.8 환경에서 플러그인 폴더 전체를 다음처럼 배치합니다. MCP를 제공하는 엔진의 `ModelContextProtocol` 플러그인이 필요하며, 의존성은 `FBX_Exporter.uplugin`에 선언되어 자동으로 함께 활성화됩니다. 이 엔진 플러그인과 C++ API가 없는 버전에서는 먼저 호환 작업이 필요합니다.
 
 ```text
-C:\GitRepo\
-└─ Unreal_Portfolio\Haven\tool-unreal-plugin\Unreal_FBX_Exporter\
+<다른 프로젝트>/Plugins/FBX_Exporter/
+├─ FBX_Exporter.uplugin
+├─ Source/
+├─ Config/
+├─ MCP/
+└─ README.md
 ```
 
-Haven 프로젝트의 `.uproject`에는 플러그인을 찾기 위한 다음 설정이 등록되어 있습니다.
+프로젝트 파일을 생성하고 대상 엔진으로 Editor를 빌드한 뒤 플러그인을 활성화합니다. 다른 엔진 버전에서 생성한 `Binaries`/`Intermediate`를 그대로 사용하는 것은 지원하지 않습니다. 배포용 패키지는 해당 엔진의 `RunUAT BuildPlugin`으로 만들 수 있으며, `Config/FilterPlugin.ini`가 README와 MCP 명세·설치 도구·공통 런타임·CLI를 패키지에 포함합니다.
 
-```json
-"AdditionalPluginDirectories": [
-    "tool-unreal-plugin"
-]
-```
+이 저장소의 Haven 프로젝트는 `.uproject`의 `AdditionalPluginDirectories: ["tool-unreal-plugin"]`로 현재 폴더를 참조합니다. 다른 프로젝트의 `Plugins` 아래에 직접 설치할 때는 이 설정이 필요 없습니다.
 
-다른 프로젝트에서 사용하려면 `AdditionalPluginDirectories`에 `Unreal_FBX_Exporter` 폴더를 포함하는 디렉터리를 등록합니다. Unreal Editor가 플러그인을 발견하지 못하면 프로젝트 파일을 다시 생성한 후 Editor를 재시작합니다.
+## MCP 사용
 
-## 사용 방법
+MCP 도구 구현·등록·입력 검사는 이 플러그인 안에 있습니다. 통신 서버는 엔진의 `ModelContextProtocol`을 공유하므로 다른 플러그인을 복사할 필요가 없습니다. 여러 플러그인을 함께 설치하면 각자 자신의 이름으로 도구를 등록합니다. FBX 플러그인을 종료할 때는 해당 도구만 해제하고 공용 서버는 종료하지 않습니다.
 
-1. Unreal Engine 5.8 프로젝트에서 플러그인이 로드되었는지 확인합니다.
-2. Content Browser에서 내보낼 Static Mesh 하나 이상을 선택합니다. 여러 에셋을 선택할 때는 모두 Static Mesh여야 합니다.
-3. 마우스 오른쪽 버튼을 클릭하고 `Asset Actions` → `FBX_Exporter` → `Export Static Meshes + Textures`를 선택합니다.
-4. 출력 루트 폴더를 입력하거나 `Browse...`로 선택합니다.
-5. `PBR Bake Resolution`에서 텍스처 해상도를 선택합니다.
-6. 출력할 맵을 선택하고 필요하면 `Reuse directly connected source textures when available`를 끕니다.
-7. 필요하면 `Embed selected textures in FBX`를 켭니다.
-8. `Export`를 누릅니다.
+| 도구 | 기능 |
+| --- | --- |
+| `fbx_exporter_status` | 현재 프로젝트, 출력 기본 경로, 실행 가능 여부 확인 |
+| `fbx_exporter_find_meshes` | 메시 이름 검색 및 정확한 에셋 경로 반환 |
+| `fbx_exporter_preflight` | LOD0/UV0·출력 경로·덮어쓰기 필요 여부 검사; 파일 생성 없음 |
+| `fbx_exporter_export` | 기존 추출 서비스로 FBX·선택 PNG·JSON 생성, 선택적으로 PNG 임베드 |
 
-출력 폴더를 지정하지 않으면 기본값은 프로젝트 폴더 아래의 `Exports/StaticMeshTextures`입니다. 한 번 선택한 경로는 프로젝트별 Editor 설정에 저장됩니다. 같은 메시 폴더가 이미 있으면 사용자 파일을 포함한 전체 폴더를 교체할지 묻습니다.
+새 프로젝트에서는 Editor를 닫고 `python Plugins/FBX_Exporter/MCP/setup_mcp.py`를 실행합니다. 활성 MCP 플러그인을 검색해 `unreal_tools` 연결을 구성하며 FBX 최신 버전만 설치하면 8개, CubeShot 최신 버전도 설치하면 17개 도구를 제공합니다. 기본 주소는 `http://127.0.0.1:8000/mcp`입니다. Editor 재시작 후 Codex의 프로젝트 MCP 설정을 다시 로드합니다. [MCP 설치·호출 안내](MCP/README.md)에 이전·백업·CLI와 인자 예제가 있습니다.
 
-## 내보내기 동작과 제한
+MCP 기본 출력은 **현재 프로젝트**의 `Saved/FBX_Exporter/Exports`입니다. `output_root`에 절대경로를 주면 변경할 수 있습니다. 해상도 기본값은 2048, 모든 맵 선택, 임베드 해제입니다. `maps: []`는 FBX만 생성합니다. 기존 메시 출력 폴더는 `overwrite: true`가 명시된 경우에만 사용자 파일까지 포함해 전체 교체됩니다. MCP는 확인창을 열지 않으며 결과의 `success`, `files`, `warnings`, `errors`를 반환합니다.
 
-- 메뉴는 선택 항목이 모두 로드 가능한 Static Mesh일 때만 표시됩니다. 텍스처나 머티리얼을 함께 선택하거나 다른 에셋을 섞으면 메뉴가 표시되지 않을 수 있습니다.
-- 텍스처를 선택한 경우 메시의 유효한 LOD0 렌더 데이터와 UV0가 필요합니다. 맵을 모두 해제한 geometry-only 내보내기는 UV0 없이 허용됩니다.
-- 머티리얼 슬롯에 할당된 머티리얼이 없으면 해당 슬롯의 텍스처는 생성되지 않고 경고가 표시됩니다.
-- FBX는 바이너리 형식으로 저장되며 Vertex Color를 포함합니다. LOD, Collision, Source Mesh는 FBX 옵션에서 내보내지 않습니다.
-- Runtime Virtual Texture, Substrate Front Material, Custom HLSL을 사용하는 머티리얼은 경고가 표시될 수 있으며, 외부 툴에서 사용할 수 있는 베이크된 PBR 텍스처만 생성됩니다.
-- FBX 표준 `Diffuse`, `NormalMap`, `Emissive`, `TransparentColor`, `TransparencyFactor`와 `UE_PBR_<Map>` 사용자 속성을 함께 기록합니다. Blender 등 DCC별 투명도 반전 규칙은 JSON/`UE_PBR_OpacityConvention`을 우선하십시오.
-- 서로 다른 선택 에셋이 같은 안전한 출력 폴더 이름으로 변환되면 충돌 방지를 위해 배치 내보내기가 중단됩니다.
+## 도킹 탭과 작업 흐름
 
-## 테스트
+`Tools → FBX Exporter`에서 독립 도킹 탭을 엽니다. Content Browser의 기존 `Export Static Meshes + Textures` 메뉴는 선택 메시를 이 탭에 추가합니다. 탭을 닫아도 접수한 작업은 계속되며 다시 열면 서비스의 작업 기록과 결과를 표시합니다.
 
-Unreal Automation Tests가 다음 영역을 검증합니다.
+1. Content Browser 선택 또는 다중 드래그 앤 드롭으로 메시를 추가합니다. 정확한 에셋 경로로 중복을 제거하고 행의 Up/Down/Remove로 순서를 변경합니다. 행 체크박스로 여러 대상을 선택하고 전역 옵션을 선택 대상에 적용하거나 선택 대상만 제거할 수 있습니다. 중복 추가는 선택과 순서를 유지합니다.
+2. `PBR`(2048, 모든 맵, 직접 재사용 켬, 임베드 끔) 또는 `Geometry Only`를 선택합니다. geometry-only에서는 해상도와 텍스처 관련 옵션이 비활성화됩니다.
+3. 출력 루트, 맵, 임베드와 경로 레이아웃을 정합니다. 행의 `Edit options`를 선택하면 같은 옵션 컨트롤에서 그 대상만 편집합니다. JSON override는 접힌 Advanced 영역에서 사용할 수 있습니다. `Preserve asset path`는 `/Game/A/SM_X.SM_X`를 `<출력 루트>/Game/A/SM_X`로 매핑합니다.
+4. `Inspect output plan`에서 모든 대상의 구체적인 FBX·metadata·슬롯 PNG 파일명, 교체될 전체 폴더와 기존 파일, 경고와 충돌을 확인합니다. 파일 상세는 접힌 스크롤 영역에 표시합니다. 실행 전 검사는 모든 대상을 처리한 뒤 오류를 모아 표시합니다. 검사 결과는 실행 결과와 별도로 유지됩니다.
+5. 기존 폴더를 교체할 때만 승인 체크박스를 선택하고 `Queue export`를 누릅니다. 이 승인은 프리셋에 저장하지 않으며 접수 후 해제됩니다.
+6. 결과에서 출력 열기, 경로 복사, 첫 PNG 미리보기, 결과 JSON 복사, 실패 재시도와 미실행 항목 실행을 사용할 수 있습니다. 기록 선택에서 이전 작업을 열 수 있으며 기본 결과 영역에 대상 상태·파일·경고·오류를 표시합니다. 재시도는 새 작업이며 덮어쓰기를 다시 확인합니다.
 
-- 파일명 안전화
-- Metallic/Ambient Occlusion/Roughness의 `Mask` 채널 패킹
-- 기존 프로젝트 설정에서 마지막 출력 경로 마이그레이션
-- 파일 게시 실패 시 기존 출력 파일 복원
-- Texture map 플래그와 선택 의존성, 이름 충돌, JSON/임베드 경로 검증
+UI의 출력 루트 기본값은 기존 프로젝트 설정 또는 `<프로젝트>/Exports/StaticMeshTextures`입니다. MCP 기본값 `Saved/FBX_Exporter/Exports`와 구분되며 UI가 자신의 경로를 서비스에 명시적으로 전달합니다.
 
-Unreal Editor의 Session Frontend에서 Automation Tests를 열고 `FBX_Exporter.Editor.StaticMeshTextureExport`를 검색해 실행할 수 있습니다.
+프로젝트별 사용자 프리셋은 `Saved/FBX_Exporter/Profiles`에 JSON으로 저장합니다. 기본 프리셋은 변경할 수 없습니다. 새 ID·표시 이름으로 저장하거나 사용자 프리셋을 삭제하고, JSON 파일 대화상자로 가져오기/내보내기를 지원합니다. 같은 사용자 ID를 저장하거나 가져올 때 교체 승인을 확인합니다. 출력 덮어쓰기 승인은 저장하지 않습니다. 선택한 사용자 프리셋이 삭제되면 새로고침·탭 재개방 시 선택 ID만 PBR로 돌아가며 편집한 옵션과 출력 경로는 유지합니다.
+
+## 단계 실행과 취소
+
+작업은 검사 → geometry → 슬롯/맵 의존 그룹 → 파일 구성 → 검증 → 게시 → 정리로 실행합니다. 각 단계 사이에 Editor tick을 양보하며 PNG 쓰기는 소유권이 분리된 픽셀과 경로만 작업 스레드로 넘깁니다. UObject·렌더링·FBX 호출은 게임 스레드에 유지하며 동시에 하나의 FBX 작업만 실행합니다. 준비된 PNG를 저장한 뒤 픽셀 버퍼를 해제해 전체 슬롯·맵의 float 버퍼가 누적되지 않게 합니다.
+
+GPU 베이크와 FBX SDK 호출은 게임 스레드에서 수행되며 그 호출 내부에서는 응답과 취소 처리가 지연될 수 있습니다. `Request cancel`은 안전한 경계에 적용합니다. 게시를 시작한 현재 메시의 출력은 마무리하며 마지막 메시가 완료됐다면 취소 요청 이후에도 작업이 성공할 수 있습니다. 첫 실패는 후속 대상을 `skipped`로 처리합니다. PIE/SIE가 시작되면 다음 안전한 경계에서 중단합니다.
+
+에셋 경로와 해석된 옵션은 접수 시 고정합니다. 메시·머티리얼·사용 텍스처는 실행 중 강하게 참조하고 변경 감지 시 게시 전 `source_changed`로 실패합니다. Editor 재시작 후 미완료 작업은 `interrupted`로 표시하고 자동으로 재실행하지 않습니다. 작업 기록은 `Saved/FBX_Exporter/Jobs`입니다.
+
+## 출력 보호와 복구
+
+기존 폴더 전체를 교체할 때는 신규 staging을 만든 뒤 journal에 원본·staging·backup 경로와 파일 목록을 기록합니다. 기존 파일 이동과 신규 파일 게시 후 모든 신규 바이트를 staging과 비교하고 commit을 기록합니다.
+
+- commit 이전 실패는 완전한 백업으로 복원을 시도합니다. 복원 실패는 staging·backup·journal을 보존하고 해당 출력의 재사용을 차단합니다.
+- commit 이후 백업 정리에 실패하면 성공과 별도 경고로 처리하고 신규 출력을 보존합니다. 일부 삭제된 백업으로 되돌리지 않습니다.
+- 강제 종료 중 게시가 미완료라면 재시작 후 복구 필요 상태로 유지됩니다. 남은 파일을 확인한 뒤 `Acknowledge inspected recovery` 또는 `fbx_exporter_job_control`의 `acknowledge_recovery`로 해당 작업의 출력 차단을 해제합니다. 이 동작은 파일을 복원·삭제하지 않습니다.
+
+복구 journal은 `Saved/FBX_Exporter/Recovery`에 저장됩니다. 실제 백업은 출력 루트의 고유 staging 옆 `_Previous` 디렉터리에 유지됩니다. 경고·결과의 경로를 확인하고 자동 삭제를 기대하지 마십시오.
+
+## 텍스처와 FBX 동작
+
+- 메시의 유효한 LOD0 렌더 데이터가 필요하며 텍스처에는 UV0와 렌더링 가능한 Editor가 필요합니다. `-nullrhi`에서는 geometry-only만 허용합니다.
+- 직접 재사용은 해당 머티리얼 속성이 엔진에서 활성 상태일 때만 허용합니다. 예를 들어 기본 volumetric translucent 머티리얼의 Metallic/Roughness는 엔진 기본값으로 베이크되며, 비활성 입력에 연결된 원본 텍스처가 이 규칙을 우회하지 않습니다. 활성 직접 재사용 소스는 Texture2D의 SRGB/legacy gamma 설정을 반영해 RGBA32F 선형 데이터로 읽습니다. 리사이즈·채널 선택과 HDR normalization 이후 최종 PNG에서만 8-bit로 변환합니다.
+- 직접 HDR Emission도 최대 RGB와 1 이상인 `emissionScale`로 정규화합니다. 복원은 sRGB PNG의 RGB를 선형으로 decode한 뒤 scale을 곱합니다. 베이크와 직접 경로 모두 FBX/JSON에 scale을 기록합니다.
+- FBX는 바이너리 형식, LOD0, Vertex Color를 포함하며 Collision/Source Mesh는 포함하지 않습니다. 누락·미사용 머티리얼 슬롯은 경고를 반환합니다.
+- Runtime Virtual Texture, Substrate Front Material, Custom HLSL은 경고를 반환할 수 있으며 외부 툴의 원본 셰이더로 변환하지 않습니다.
+- 파일명은 Windows 예약 이름과 끝의 dot/space를 처리합니다. 정규화된 대소문자 경로가 겹치면 배치를 거부합니다.
+
+## 검증
+
+`FBX_Exporter.Editor` Automation Tests는 파일명·Mask·맵 의존성·설정 이전·게시 복원·부분 백업 삭제 후 commit 보존·복원 실패 journal 차단/해제·sRGB ramp와 float HDR source·비활성 속성의 직접 재사용 거부·MCP 등록/스키마·엔진 Cube geometry 출력·덮어쓰기 보호를 검증합니다. 공통 작업 런타임 테스트는 접수 멱등성·취소·중단 복구·프리셋과 단계 실행 계약을 검증합니다. UI 상태 검증은 다중 선택·중복 유지·선택 대상 옵션 스냅샷·선택 제거 순서를 검증하며, 지연 MCP 등록 세대 검증은 unregister/re-register 이후 이전 요청이 EDITOR_INTERRUPTED로 한 번만 완료되는지 확인합니다. `Integration.GPUAndEmbeddedRoundTrip`은 임시 두 슬롯 메시에서 실제 GPU·Normal/Opacity/Mask/HDR 픽셀·선택 맵·FBX SDK 재import·임베드 PNG 바이트와 4096 처리를 검증하고 메모리 수치를 기록합니다. `Integration.WorkspaceScreenshots`는 실제 작업 공간을 사용하는 테스트 소유 창에서 두 화면 크기의 내용 PNG를 저장하며 최소 내용 크기를 검증합니다. 사용자 Editor 창의 크기를 바꾸지 않습니다.
+
+Session Frontend의 Automation Tests에서 이 접두사를 실행할 수 있습니다. 렌더링 테스트와 GPU 베이크, 재import·임베드, 실제 독립 패키지 검증은 별도 테스트 프로젝트에서 수행하며, 수행 결과는 프로젝트 검증 기록에 남깁니다. 기능 설명 자체를 검증 실행 결과로 간주하지 않습니다.
+
+`Integration.SourceChanged`는 Editor 프레임마다 실제 단계 runner를 전진시키고 geometry 이후 머티리얼 의존성을 변경하여 `source_changed`와 게시 차단을 검증합니다. `Integration.GuardedPublishingCrash`는 일반 테스트 실행에서 비활성입니다. 실제 프로세스 중단 검증은 별도 소유 fixture 프로젝트와 두 명시적 테스트 플래그가 있을 때만 원본 첫 파일을 백업으로 옮긴 직후 journal/checkpoint를 저장하고 종료 코드 86으로 프로세스를 중단합니다. 재시작 시 차단과 파일을 바꾸지 않는 명시적 복구 승인을 외부 검증으로 확인합니다.
+
+## 1.2 공통 서비스
+
+GUI와 MCP가 동일한 옵션 정규화·전체 배치 계획·출력 예약 검사를 사용하며 실행기는 기존 작업 큐를 공유합니다. 단일·비동기 MCP 호출도 원래 오류 코드를 전달합니다. MaterialBaking의 기존 linear 모드를 베이크 종료 후 복원하며 HDR 모드를 변경하지 않습니다. Material JSON 및 FBX 연결 규칙은 유지합니다.

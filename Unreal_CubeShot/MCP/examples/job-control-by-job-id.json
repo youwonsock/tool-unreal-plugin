@@ -1,0 +1,7 @@
+{
+  "tool": "cubeshot_job_control",
+  "arguments": {
+    "job_id": "cubeshot-11112222333344445555666677778888",
+    "action": "acknowledge_recovery"
+  }
+}

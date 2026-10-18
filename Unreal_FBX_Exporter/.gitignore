@@ -32,3 +32,9 @@ Saved/
 # Operating-system files
 .DS_Store
 Thumbs.db
+
+# Python MCP client
+__pycache__/
+*.py[cod]
+.venv/
+*.unreal-tools.bak

@@ -5,6 +5,7 @@
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/Texture2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "ImageCore.h"
@@ -14,6 +15,8 @@
 #include "PreviewScene.h"
 #include "RHIGlobals.h"
 #include "StaticMeshCompiler.h"
+#include "TextureCompiler.h"
+#include "Materials/MaterialInterface.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -21,7 +24,7 @@
 
 namespace
 {
-    constexpr double MinimumNearPlane = 0.1;
+    constexpr double MinimumNearPlane = CubeShot::MinimumNearPlane;
     constexpr double MinimumClipMargin = 1.0;
 
     TArray<FVector> GetBoundsCorners(const FBoxSphereBounds& Bounds)
@@ -56,18 +59,7 @@ namespace
         OutUp = FVector::CrossProduct(OutForward, OutRight).GetSafeNormal();
     }
 
-    bool IsUsableBounds(const FBoxSphereBounds& Bounds)
-    {
-        const bool bFiniteOrigin = FMath::IsFinite(Bounds.Origin.X)
-            && FMath::IsFinite(Bounds.Origin.Y)
-            && FMath::IsFinite(Bounds.Origin.Z);
-        const bool bFiniteExtent = FMath::IsFinite(Bounds.BoxExtent.X)
-            && FMath::IsFinite(Bounds.BoxExtent.Y)
-            && FMath::IsFinite(Bounds.BoxExtent.Z);
-        return bFiniteOrigin
-            && bFiniteExtent
-            && Bounds.BoxExtent.GetMax() > UE_SMALL_NUMBER;
-    }
+
 }
 
 FCubeShotCaptureService::FCubeShotCaptureService() = default;
@@ -79,6 +71,7 @@ FCubeShotCaptureService::~FCubeShotCaptureService()
 
 bool FCubeShotCaptureService::Initialize(const FCubeShotOptions& Options, FText& OutError)
 {
+    if (!CubeShot::CanExecute(OutError)) return false;
     if (!PreviewScene.IsValid() && !CreatePreviewScene(OutError))
     {
         return false;
@@ -126,15 +119,6 @@ bool FCubeShotCaptureService::UpdateOptions(const FCubeShotOptions& Options, FTe
     {
         const double DepthExtent = Options.StaticMesh->GetBounds().BoxExtent.GetMax();
         const double ClipMargin = FMath::Max(Options.StaticMesh->GetBounds().SphereRadius * 0.1, MinimumClipMargin);
-        if (CurrentOptions.CameraDistance <= DepthExtent + MinimumNearPlane)
-        {
-            OutError = FText::Format(
-                LOCTEXT(
-                    "ManualCameraInsideBounds",
-                    "Camera Distance must be greater than {0} cm so every view remains in front of the near plane."),
-                FText::AsNumber(DepthExtent + MinimumNearPlane));
-            return false;
-        }
         CurrentAutoFit.NearPlane = FMath::Max(MinimumNearPlane, CurrentOptions.CameraDistance - DepthExtent - ClipMargin);
         CurrentAutoFit.FarPlane = FMath::Max(
             CurrentAutoFit.NearPlane + MinimumClipMargin,
@@ -152,6 +136,29 @@ bool FCubeShotCaptureService::UpdateOptions(const FCubeShotOptions& Options, FTe
         MeshComponent->SetRelativeTransform(FTransform::Identity);
         MeshComponent->MarkRenderStateDirty();
         MeshComponent->SetTextureForceResidentFlag(true);
+
+        // The panel normally gives streaming several ticks before Generate. MCP
+        // can capture on the first load, so resolve only this mesh's resources.
+        // Otherwise the saved icon contains the default material or tiny mips.
+        TArray<UTexture*> UsedTextures;
+        for (const FStaticMaterial& Slot : Options.StaticMesh->GetStaticMaterials())
+        {
+            if (UMaterialInterface* Material = Slot.MaterialInterface)
+            {
+                Material->EnsureIsComplete();
+                TArray<UTexture*> MaterialTextures;
+                Material->GetUsedTextures(MaterialTextures);
+                for (UTexture* Texture : MaterialTextures) UsedTextures.AddUnique(Texture);
+            }
+        }
+        FTextureCompilingManager::Get().FinishCompilation(UsedTextures);
+        for (UTexture* Texture : UsedTextures)
+        {
+            if (UTexture2D* Texture2D = Cast<UTexture2D>(Texture))
+            {
+                Texture2D->WaitForStreaming();
+            }
+        }
     }
 
     CaptureComponent->ProjectionType = CurrentOptions.ProjectionMode == ECubeShotProjectionMode::Perspective
@@ -271,14 +278,10 @@ bool FCubeShotCaptureService::CaptureRaw(
     return CubeShot::Image::ConvertInverseOpacityImage(CapturedImage, OutFrame, OutError);
 }
 
-bool FCubeShotCaptureService::Composite(
-    const FCubeShotRawFrame& RawFrame,
-    const FCubeShotOptions& Options,
-    const int32 TargetResolution,
-    FCubeShotImage& OutImage,
-    FText& OutError)
+bool FCubeShotCaptureService::ResolveBackground(const FCubeShotOptions& Options, int32 TargetResolution,
+    TSharedPtr<const FImage>& OutImage, FText& OutError)
 {
-    const FImage* PreparedBackground = nullptr;
+    OutImage.Reset();
     if (Options.BackgroundMode == ECubeShotBackgroundMode::Texture)
     {
         if (!IsValid(Options.BackgroundTexture))
@@ -294,11 +297,11 @@ bool FCubeShotCaptureService::Composite(
             && CachedBackgroundResolution == TargetResolution;
         if (!bCacheMatches)
         {
-            TUniquePtr<FImage> NewBackground = MakeUnique<FImage>();
+            TSharedRef<FImage> NewBackground = MakeShared<FImage>();
             if (!CubeShot::Image::PrepareBackgroundImage(
                 Options.BackgroundTexture,
                 TargetResolution,
-                *NewBackground,
+                NewBackground.Get(),
                 OutError))
             {
                 CachedBackgroundImage.Reset();
@@ -308,12 +311,12 @@ bool FCubeShotCaptureService::Composite(
                 return false;
             }
 
-            CachedBackgroundImage = MoveTemp(NewBackground);
+            CachedBackgroundImage = NewBackground;
             CachedBackgroundTexture = Options.BackgroundTexture;
             CachedBackgroundSourceId = SourceId;
             CachedBackgroundResolution = TargetResolution;
         }
-        PreparedBackground = CachedBackgroundImage.Get();
+        OutImage = CachedBackgroundImage;
     }
     else
     {
@@ -323,40 +326,46 @@ bool FCubeShotCaptureService::Composite(
         CachedBackgroundResolution = 0;
     }
 
-    return CubeShot::Image::Composite(
-        RawFrame,
-        Options,
-        TargetResolution,
-        OutImage,
-        OutError,
-        PreparedBackground);
+    return true;
 }
 
-bool FCubeShotCaptureService::CaptureAndComposite(
-    const FCubeShotOptions& Options,
-    const ECubeShotDirection Direction,
-    const int32 TargetResolution,
-    FCubeShotImage& OutImage,
-    FText& OutError)
+bool FCubeShotCaptureService::Composite(const FCubeShotRawFrame& RawFrame, const FCubeShotOptions& Options,
+    int32 TargetResolution, FCubeShotImage& OutImage, FText& OutError)
 {
-    OutImage.Reset();
-    const bool bOptionsApplied = bInitialized
-        ? UpdateOptions(Options, OutError)
-        : Initialize(Options, OutError);
-    if (!bOptionsApplied)
-    {
-        return false;
-    }
+    TSharedPtr<const FImage> Background;
+    if (!ResolveBackground(Options, TargetResolution, Background, OutError)) return false;
+    return CubeShot::Image::Composite(RawFrame, Options, TargetResolution, OutImage, OutError, Background.Get());
+}
 
+bool FCubeShotCaptureService::PrepareCompositeWork(FCubeShotRawFrame RawFrame, const FCubeShotOptions& Options,
+    int32 TargetResolution, FCubeShotPixelWork& OutWork, FText& OutError)
+{
+    TSharedPtr<const FImage> Background;
+    if (!ResolveBackground(Options, TargetResolution, Background, OutError)) return false;
+    FCubeShotOptions PixelOptions = Options;
+    PixelOptions.StaticMesh = nullptr; PixelOptions.BackgroundTexture = nullptr;
+    OutWork = [Frame = MoveTemp(RawFrame), PixelOptions, TargetResolution, Background](FCubeShotImage& Image, FText& Error)
+    {
+        return CubeShot::Image::Composite(Frame, PixelOptions, TargetResolution, Image, Error, Background.Get());
+    };
+    return true;
+}
+
+bool FCubeShotCaptureService::PrepareCaptureWork(const FCubeShotOptions& Options, ECubeShotDirection Direction,
+    int32 TargetResolution, FCubeShotPixelWork& OutWork, FText& OutError)
+{
+    if (!(bInitialized ? UpdateOptions(Options, OutError) : Initialize(Options, OutError))) return false;
     FCubeShotRawFrame RawFrame;
-    if (!CaptureRaw(Direction, TargetResolution, RawFrame, OutError))
-    {
-        return false;
-    }
+    if (!CaptureRaw(Direction, TargetResolution, RawFrame, OutError)) return false;
+    return PrepareCompositeWork(MoveTemp(RawFrame), Options, TargetResolution, OutWork, OutError);
+}
 
-    const bool bComposited = Composite(RawFrame, Options, TargetResolution, OutImage, OutError);
-    RawFrame.Reset();
-    return bComposited;
+bool FCubeShotCaptureService::CaptureAndComposite(const FCubeShotOptions& Options, ECubeShotDirection Direction,
+    int32 TargetResolution, FCubeShotImage& OutImage, FText& OutError)
+{
+    OutImage.Reset(); FCubeShotPixelWork Work;
+    if (!PrepareCaptureWork(Options, Direction, TargetResolution, Work, OutError)) return false;
+    return Work(OutImage, OutError);
 }
 
 void FCubeShotCaptureService::Shutdown()
@@ -417,11 +426,7 @@ bool FCubeShotCaptureService::CalculateAutoFitForBounds(
     OutAutoFit = FCubeShotAutoFitResult();
     OutError = FText::GetEmpty();
 
-    if (!IsUsableBounds(Bounds))
-    {
-        OutError = LOCTEXT("InvalidAutoFitBounds", "The mesh has invalid or empty bounds.");
-        return false;
-    }
+    if (!CubeShot::ValidateBounds(Bounds,OutError)) return false;
     if (!FMath::IsFinite(FieldOfViewDegrees) || FieldOfViewDegrees < 1.0 || FieldOfViewDegrees > 170.0)
     {
         OutError = LOCTEXT("InvalidAutoFitFov", "Auto Fit requires an FOV between 1 and 170 degrees.");

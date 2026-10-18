@@ -18,13 +18,18 @@ public class CubeShot : ModuleRules
             new[]
             {
                 "AppFramework",
+                "ApplicationCore",
                 "AssetRegistry",
                 "AssetTools",
                 "ContentBrowser",
+                "DesktopPlatform",
                 "ImageCore",
                 "ImageWrapper",
                 "InputCore",
                 "LevelEditor",
+                "Json",
+                "JsonUtilities",
+                "ModelContextProtocol",
                 "PropertyEditor",
                 "RenderCore",
                 "RHI",

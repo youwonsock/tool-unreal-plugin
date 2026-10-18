@@ -12,6 +12,54 @@ THIRD_PARTY_INCLUDES_END
 
 namespace FBXExporter
 {
+namespace Testing
+{
+	struct FImportedEmbeddedData { TMap<FString, TArray<uint8>> Files; };
+	FbxCallback::State ReadVerifiedEmbedded(void* User, FbxClassId, const char* FileName, const void* Buffer, size_t Size)
+	{
+		if (!User || !FileName || !Buffer || Size == 0 || Size > MAX_int32) return FbxCallback::eFailure;
+		TArray<uint8> Bytes; Bytes.Append(static_cast<const uint8*>(Buffer), static_cast<int32>(Size));
+		static_cast<FImportedEmbeddedData*>(User)->Files.Add(FPaths::GetCleanFilename(UTF8_TO_TCHAR(FileName)), MoveTemp(Bytes));
+		return FbxCallback::eHandled;
+	}
+	bool VerifyImportedMedia(const FString& FbxPath, bool bExpectEmbedded, int32 MinimumMaterials, int32& TextureCount, FString& OutError)
+	{
+		TextureCount = 0;
+		FbxManager* Manager = FbxManager::Create(); if (!Manager) { OutError = TEXT("FBX Manager initialization failed."); return false; }
+		Manager->SetIOSettings(FbxIOSettings::Create(Manager, IOSROOT));
+		FbxScene* Scene = FbxScene::Create(Manager, "FBXExporterRoundTrip"); FbxImporter* Importer = FbxImporter::Create(Manager, "FBXExporterVerificationImporter");
+		FImportedEmbeddedData Embedded;
+		if (!Importer->Initialize(TCHAR_TO_UTF8(*FbxPath), -1, Manager->GetIOSettings())) { OutError = UTF8_TO_TCHAR(Importer->GetStatus().GetErrorString()); Manager->Destroy(); return false; }
+		FbxEmbeddedFileCallback* Callback = FbxEmbeddedFileCallback::Create(Manager, "FBXExporterVerificationMedia");
+		Callback->RegisterReadFunction(ReadVerifiedEmbedded, &Embedded); Importer->SetEmbeddedFileReadCallback(Callback);
+		if (!Importer->Import(Scene)) { OutError = UTF8_TO_TCHAR(Importer->GetStatus().GetErrorString()); Manager->Destroy(); return false; }
+		bool bValid = Scene->GetSrcObjectCount<FbxSurfaceMaterial>() >= MinimumMaterials;
+		for (int32 Index = 0; Index < Scene->GetSrcObjectCount<FbxFileTexture>(); ++Index)
+		{
+			FbxFileTexture* Texture = Scene->GetSrcObject<FbxFileTexture>(Index);
+			FString Relative = UTF8_TO_TCHAR(Texture->GetRelativeFileName()); Relative.ReplaceInline(TEXT("\\"), TEXT("/"));
+			if (!Relative.StartsWith(TEXT("Textures/")) || FPaths::IsRelative(Relative) == false || Relative.Contains(TEXT(".."))) { bValid = false; continue; }
+			TArray<uint8> External;
+			if (!FFileHelper::LoadFileToArray(External, *(FPaths::GetPath(FbxPath) / Relative)) || External.IsEmpty()) { bValid = false; continue; }
+			if (bExpectEmbedded)
+			{
+				const TArray<uint8>* Bytes = Embedded.Files.Find(FPaths::GetCleanFilename(Relative));
+				if (!Bytes || *Bytes != External) bValid = false;
+			}
+			++TextureCount;
+		}
+		bool bLinked = false;
+		for (int32 Index = 0; Index < Scene->GetSrcObjectCount<FbxSurfaceMaterial>(); ++Index)
+		{
+			FbxSurfaceMaterial* Material = Scene->GetSrcObject<FbxSurfaceMaterial>(Index);
+			for (FbxProperty Property = Material->GetFirstProperty(); Property.IsValid(); Property = Material->GetNextProperty(Property))
+				if (Property.GetSrcObjectCount<FbxFileTexture>() > 0) bLinked = true;
+		}
+		bValid &= bLinked && TextureCount > 0;
+		if (!bValid) OutError = TEXT("FBX reimport must preserve materials, texture links, relative files and matching embedded PNG bytes.");
+		Manager->Destroy(); return bValid;
+	}
+}
 namespace
 {
 struct FEmbeddedFileContext
@@ -410,7 +458,7 @@ bool AddTexturePair(
 	FEmbeddedFileContext& EmbeddedContext,
 	FString& OutError)
 {
-	if (!Scene || !Material || FileData.FileBytes.IsEmpty())
+	if (!Scene || !Material || (bEmbed && FileData.FileBytes.IsEmpty()))
 	{
 		OutError = TEXT("Invalid FBX texture data.");
 		return false;

@@ -160,10 +160,6 @@ bool FCubeShotViewModel::Validate()
 		ValidationError = BackgroundTextureSourceError;
 		ValidationWarning = FText::GetEmpty();
 	}
-	if (bOptionsValid)
-	{
-		AppendMaterialWarning(ValidationWarning);
-	}
 	return bOptionsValid;
 }
 
@@ -239,41 +235,6 @@ void FCubeShotViewModel::InvalidateBackgroundTextureSourceCache()
 	CachedBackgroundTextureSourceError = FText::GetEmpty();
 	bHasBackgroundTextureSourceResult = false;
 	bCachedBackgroundTextureSourceValid = false;
-}
-
-void FCubeShotViewModel::AppendMaterialWarning(FText& InOutWarning) const
-{
-	if (!StaticMesh.IsValid())
-	{
-		return;
-	}
-
-	bool bHasBestEffortMaterial = false;
-	for (const FStaticMaterial& StaticMaterial : StaticMesh->GetStaticMaterials())
-	{
-		const UMaterialInterface* Material = StaticMaterial.MaterialInterface;
-		if (Material != nullptr)
-		{
-			const EBlendMode BlendMode = Material->GetBlendMode();
-			if (BlendMode != BLEND_Opaque && BlendMode != BLEND_Masked)
-			{
-				bHasBestEffortMaterial = true;
-				break;
-			}
-		}
-	}
-
-	if (!bHasBestEffortMaterial)
-	{
-		return;
-	}
-
-	const FText MaterialWarning = LOCTEXT(
-		"BestEffortMaterialWarning",
-		"Translucent, additive, and refractive materials are captured on a best-effort basis.");
-	InOutWarning = InOutWarning.IsEmpty()
-		? MaterialWarning
-		: FText::Format(LOCTEXT("CombinedWarning", "{0}\n{1}"), InOutWarning, MaterialWarning);
 }
 
 #undef LOCTEXT_NAMESPACE

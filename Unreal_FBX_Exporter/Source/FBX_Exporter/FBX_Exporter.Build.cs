@@ -15,11 +15,13 @@ public class FBX_Exporter : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			"ApplicationCore",
 			"AssetRegistry",
 			"AssetTools",
 			"ContentBrowser",
 			"DesktopPlatform",
 			"ImageCore",
+			"ImageWrapper",
 			"InputCore",
 			"Json",
 			"JsonUtilities",
@@ -28,6 +30,8 @@ public class FBX_Exporter : ModuleRules
 			"MaterialUtilities",
 			"MeshDescription",
 			"MeshMergeUtilities",
+			"ModelContextProtocol",
+			"RHI",
 			"Slate",
 			"SlateCore",
 			"StaticMeshDescription",

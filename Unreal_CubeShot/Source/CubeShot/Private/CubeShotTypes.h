@@ -103,6 +103,8 @@ struct FCubeShotImage
         bHasTransparency = false;
     }
 };
+/** Owns only CPU pixels and primitive options; it never reads or changes a UObject. */
+using FCubeShotPixelWork = TFunction<bool(FCubeShotImage&, FText&)>;
 
 struct FCubeShotOutputDescriptor
 {
@@ -127,11 +129,18 @@ struct FCubeShotPreflightResult
 
 struct FCubeShotGenerationResult
 {
+    int32 StagedFaces = 0;
     bool bSucceeded = false;
     bool bCancelled = false;
     FString StagingDirectory;
+    /** Immutable processed face files. The queue publisher owns successful-stage cleanup. */
+    TArray<FString> StagedFilenames;
     TArray<FString> SavedObjectPaths;
     TArray<FString> FailedObjectPaths;
+    TArray<FString> DirtyPackages;
+    TArray<FString> Errors;
+    TArray<FString> Warnings;
+    FString ErrorCode;
     FText Message;
 };
 
@@ -141,10 +150,14 @@ namespace CubeShot
     constexpr int32 MaxResolution = 4096;
     constexpr int32 PreviewResolution = 512;
     constexpr double FrameFill = 0.90;
+    constexpr double MinimumNearPlane = 0.1;
 
     const TArray<FCubeShotDirectionInfo>& GetDirectionInfos();
     const FCubeShotDirectionInfo& GetDirectionInfo(ECubeShotDirection Direction);
     bool IsPowerOfTwoResolution(int32 Resolution);
+    /** Pure shared geometry/camera validation; does not access UObjects or the renderer. */
+    bool ValidateBounds(const FBoxSphereBounds& Bounds, FText& OutError);
+    bool ValidateBoundsAndCamera(const FBoxSphereBounds& Bounds, const FCubeShotOptions& Options, FText& OutError);
     /**
      * Validates editor source art without converting it to RGBA. Passing bProbeMip0=true
      * briefly locks mip 0 to prove its payload is readable; callers should cache that result.
@@ -154,4 +167,8 @@ namespace CubeShot
         bool bProbeMip0,
         FText& OutError);
     bool ValidateOptions(const FCubeShotOptions& Options, FText& OutError, FText& OutWarning);
+    /** Shared UI/MCP policy. Null RHI has a non-null GDynamicRHI, so check GUsingNullRHI. */
+    bool CanExecute(FText& OutError);
+    bool EvaluateExecutionPolicy(bool bEditor, bool bPIE, bool bSIE, bool bCanRender,
+        bool bNullRhi, bool bRhiPresent, FText& OutError);
 }

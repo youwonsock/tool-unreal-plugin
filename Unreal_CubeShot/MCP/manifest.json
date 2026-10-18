@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "id": "cubeshot",
+  "plugin": "CubeShot",
+  "status_tool": "cubeshot_status",
+  "api_version": "1.2.0",
+  "minimum_runtime_version": "1.2.0",
+  "capabilities": [
+    "profiles",
+    "jobs",
+    "extended_options",
+    "batch_preflight",
+    "history_retention",
+    "record_diagnostics",
+    "png_overwrite"
+  ],
+  "job_tools": {
+    "start": "cubeshot_job_start",
+    "status": "cubeshot_job_status",
+    "control": "cubeshot_job_control"
+  },
+  "compatible_tool_sets": [
+    [
+      "cubeshot_status",
+      "cubeshot_find_meshes",
+      "cubeshot_preflight",
+      "cubeshot_generate",
+      "cubeshot_export_png"
+    ]
+  ],
+  "tools": [
+    "cubeshot_status",
+    "cubeshot_find_meshes",
+    "cubeshot_preflight",
+    "cubeshot_generate",
+    "cubeshot_export_png",
+    "cubeshot_profiles",
+    "cubeshot_job_start",
+    "cubeshot_job_status",
+    "cubeshot_job_control"
+  ]
+}

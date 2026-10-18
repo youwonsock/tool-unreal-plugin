@@ -87,3 +87,8 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+# Python MCP runtime
+__pycache__/
+*.py[cod]
+.venv/
+*.unreal-tools.bak

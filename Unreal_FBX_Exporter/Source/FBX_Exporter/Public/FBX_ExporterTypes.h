@@ -28,6 +28,8 @@ struct FBX_EXPORTER_API FFBXExporterOptions
 	bool bReuseDirectTextures = true;
 	EFBXExporterTextureMap TextureMaps = EFBXExporterTextureMap::All;
 	bool bEmbedTexturesInFbx = false;
+	// "mesh_name" preserves the original layout; "asset_path" preserves mounts.
+	FString OutputLayout = TEXT("mesh_name");
 };
 
 struct FBX_EXPORTER_API FFBXExporterResult
@@ -36,6 +38,9 @@ struct FBX_EXPORTER_API FFBXExporterResult
 	FString FinalDirectory;
 	TArray<FString> Warnings;
 	TArray<FString> Errors;
+	FString RecoveryJournal;
+	FString RecoveryStaging;
+	FString RecoveryBackup;
 
 	bool Succeeded() const
 	{

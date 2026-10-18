@@ -32,3 +32,8 @@ Saved/
 # Operating-system files
 .DS_Store
 Thumbs.db
+
+# MCP Python client local files
+__pycache__/
+*.pyc
+.venv/

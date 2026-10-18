@@ -14,6 +14,8 @@
 #include "UObject/Package.h"
 #include "UObject/ObjectRedirector.h"
 #include "UObject/UObjectGlobals.h"
+#include "UObject/StrongObjectPtr.h"
+#include "ImageCore.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
     FCubeShotOutputPathTest,
@@ -283,6 +285,8 @@ bool FCubeShotAssetIdentityTest::RunTest(const FString& Parameters)
         OriginalFront = LoadObject<UTexture2D>(nullptr, *FirstPreflight.Outputs[0].GetObjectPath());
     }
     TestNotNull(TEXT("Front texture exists after first write"), OriginalFront);
+    TArray<TStrongObjectPtr<UTexture2D>> OriginalTextures;
+    for(const auto& Output:FirstPreflight.Outputs)OriginalTextures.Emplace(LoadObject<UTexture2D>(nullptr,*Output.GetObjectPath()));
 
     FCubeShotPreflightResult SecondPreflight;
     FCubeShotGenerationResult SecondResult;
@@ -307,6 +311,19 @@ bool FCubeShotAssetIdentityTest::RunTest(const FString& Parameters)
         UpdatedFront = LoadObject<UTexture2D>(nullptr, *SecondPreflight.Outputs[0].GetObjectPath());
     }
     TestTrue(TEXT("Existing Texture2D object identity is preserved"), OriginalFront == UpdatedFront && UpdatedFront != nullptr);
+    TestEqual(TEXT("All six original textures strongly held"),OriginalTextures.Num(),6);
+    for(int32 Index=0;Index<OriginalTextures.Num();++Index)
+    {
+        UTexture2D* Updated=LoadObject<UTexture2D>(nullptr,*FirstPreflight.Outputs[Index].GetObjectPath());
+        TestTrue(TEXT("Every Texture2D retains UObject identity"),Updated==OriginalTextures[Index].Get()&&Updated!=nullptr);
+        if(Updated)
+        {
+            FImage Source;TestTrue(TEXT("Updated source reads"),Updated->Source.GetMipImage(Source,0));FImage Converted;Source.CopyTo(Converted,ERawImageFormat::BGRA8,EGammaSpace::sRGB);
+            if(!Converted.RawData.IsEmpty())TestEqual(TEXT("Source pixels replaced by second capture"),Converted.AsBGRA8()[0],FColor(10,40,220,255));
+            TestFalse(TEXT("Successful overwritten package is clean"),Updated->GetOutermost()->IsDirty());
+        }
+    }
+    OriginalTextures.Reset();
 
     AssetRegistry.OnInMemoryAssetCreated().Remove(AssetCreatedHandle);
 

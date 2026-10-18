@@ -113,3 +113,18 @@ bool FCubeShotSupersamplePolicyTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("4096 captures at 1x"), FCubeShotCaptureService::GetCaptureResolution(4096), 4096);
     return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotBoundsCameraValidationTest,
+    "CubeShot.Editor.Capture.SharedBoundsAndManualCameraValidation",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCubeShotBoundsCameraValidationTest::RunTest(const FString&)
+{
+    const FBoxSphereBounds Bounds(FVector(10,20,30),FVector(50,30,20),65);FCubeShotOptions Options;FText Error;
+    Options.bAutoFit=false;Options.CameraDistance=.01;
+    TestFalse(TEXT("Manual camera inside bounds is rejected without a renderer"),CubeShot::ValidateBoundsAndCamera(Bounds,Options,Error));
+    Options.CameraDistance=Bounds.BoxExtent.GetMax()+CubeShot::MinimumNearPlane;
+    TestFalse(TEXT("Manual camera exactly at near-plane boundary is rejected"),CubeShot::ValidateBoundsAndCamera(Bounds,Options,Error));
+    Options.CameraDistance+=.0001;TestTrue(TEXT("Manual camera strictly above near-plane boundary is valid"),CubeShot::ValidateBoundsAndCamera(Bounds,Options,Error));
+    Options.bAutoFit=true;Options.CameraDistance=.01;TestTrue(TEXT("Auto fit accepts the unused positive distance"),CubeShot::ValidateBoundsAndCamera(Bounds,Options,Error));
+    FBoxSphereBounds Invalid=Bounds;Invalid.BoxExtent.Y=-1;TestFalse(TEXT("Negative extents are invalid for every capture path"),CubeShot::ValidateBounds(Invalid,Error));
+    Invalid=Bounds;Invalid.SphereRadius=-1;TestFalse(TEXT("Invalid radius is rejected before clipping math"),CubeShot::ValidateBounds(Invalid,Error));return true;
+}

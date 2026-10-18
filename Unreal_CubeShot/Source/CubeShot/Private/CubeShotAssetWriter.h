@@ -5,6 +5,7 @@
 #include "Engine/TextureDefines.h"
 
 class FCubeShotCaptureService;
+class UPackage;
 
 /** Controls where generated assets and lossless intermediate images are written. */
 struct FCubeShotAssetWriterConfig
@@ -20,6 +21,12 @@ struct FCubeShotAssetWriterConfig
 
     /** The panel normally performs the final Content Browser sync. */
     bool bSyncContentBrowserOnSuccess = false;
+    /** Internal queue policy: retain processed faces until PNG publication has finished. */
+    bool bRetainSuccessfulStaging = false;
+    /** Domain failure injection for safety automation; production leaves this unset. */
+    TFunction<bool(const FString& /*Operation*/, const FString& /*Path*/)> ShouldFailOperation;
+    /** Internal UI/test injection, never serialized or accepted from MCP options. */
+    TFunction<bool(const TArray<UPackage*>&, FText&)> CheckoutCallback;
 };
 
 using FCubeShotProgressCallback = TFunction<void(int32 /*Completed*/, int32 /*Total*/, const FText& /*Status*/)>;
@@ -30,6 +37,8 @@ using FCubeShotCaptureCallback = TFunction<bool(
     int32 /*TargetResolution*/,
     FCubeShotImage&,
     FText& /*OutError*/)>;
+using FCubeShotPrepareCaptureCallback = TFunction<bool(const FCubeShotOptions&, ECubeShotDirection,
+    int32, FCubeShotPixelWork&, FText&)>;
 
 /**
  * Performs the non-transactional CubeShot asset generation workflow.
@@ -41,6 +50,8 @@ using FCubeShotCaptureCallback = TFunction<bool(
 class FCubeShotAssetWriter
 {
 public:
+    /** One Step captures one face; the six-package mutation/save is one critical step. */
+    class FExecution;
     explicit FCubeShotAssetWriter(FCubeShotAssetWriterConfig InConfig = FCubeShotAssetWriterConfig());
 
     /** Builds output names and rejects every known collision before an overwrite prompt is shown. */
@@ -70,6 +81,17 @@ public:
         FCubeShotGenerationResult& OutResult) const;
 
     const FCubeShotAssetWriterConfig& GetConfig() const { return Config; }
+    bool CheckoutForInteractiveSubmission(const TArray<FCubeShotOutputDescriptor>& Outputs, FText& Error) const;
+    void FinalizeStaging(FCubeShotGenerationResult& Result) const;
+
+    TUniquePtr<FExecution> BeginExecution(const FCubeShotOptions& Options,
+        const FCubeShotCaptureCallback& Capture, const FCubeShotPreflightResult& Preflight,
+        bool bOverwriteConfirmed, FCubeShotProgressCallback Progress = {},
+        FCubeShotCancelCallback ShouldCancel = {}) const;
+    TUniquePtr<FExecution> BeginPreparedExecution(const FCubeShotOptions& Options,
+        FCubeShotPrepareCaptureCallback Capture, const FCubeShotPreflightResult& Preflight,
+        bool bOverwriteConfirmed, FCubeShotProgressCallback Progress = {},
+        FCubeShotCancelCallback ShouldCancel = {}) const;
 
     /** Pure path helper used by preflight and automation tests. */
     static bool BuildOutputDescriptorsFromSource(
@@ -93,16 +115,8 @@ private:
     };
 
     bool ValidateOutputRoot(FText& OutError) const;
+    bool ValidateOutputPermissions(FText& OutError) const;
     bool InspectOutput(const FCubeShotOutputDescriptor& Output, bool& bOutExists, FText& OutError) const;
-    bool StageCaptures(
-        const FCubeShotOptions& Options,
-        const FCubeShotCaptureCallback& Capture,
-        const TArray<FCubeShotOutputDescriptor>& Outputs,
-        const FString& StagingDirectory,
-        const FCubeShotProgressCallback& Progress,
-        const FCubeShotCancelCallback& ShouldCancel,
-        TArray<FString>& OutStagedFilenames,
-        FCubeShotGenerationResult& OutResult) const;
     void ExecuteInternal(
         const FCubeShotOptions& Options,
         const FCubeShotCaptureCallback& Capture,
@@ -128,4 +142,19 @@ private:
     bool DeleteStagingDirectory(const FString& StagingDirectory) const;
 
     FCubeShotAssetWriterConfig Config;
+};
+
+class FCubeShotAssetWriter::FExecution
+{
+public:
+    ~FExecution();
+    bool Step(bool bInlineMode = true);
+    bool IsCritical() const;
+    FString GetStage() const;
+    const FCubeShotGenerationResult& GetResult() const;
+private:
+    friend class FCubeShotAssetWriter;
+    struct FState;
+    explicit FExecution(TUniquePtr<FState> InState);
+    TUniquePtr<FState> State;
 };

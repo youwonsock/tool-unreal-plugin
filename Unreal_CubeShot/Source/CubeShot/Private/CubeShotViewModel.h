@@ -59,7 +59,6 @@ private:
 	void RefreshObjectPointers();
 	bool ValidateCachedBackgroundTextureSource(FText& OutError);
 	void InvalidateBackgroundTextureSourceCache();
-	void AppendMaterialWarning(FText& InOutWarning) const;
 
 	FCubeShotOptions Options;
 	TStrongObjectPtr<UStaticMesh> StaticMesh;

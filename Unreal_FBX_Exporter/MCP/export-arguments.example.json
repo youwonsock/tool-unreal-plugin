@@ -1,0 +1,7 @@
+{
+  "mesh_path": "/Engine/BasicShapes/Cube.Cube",
+  "resolution": 512,
+  "maps": ["BaseColor", "Normal"],
+  "embed_textures": true,
+  "reuse_direct_textures": true
+}

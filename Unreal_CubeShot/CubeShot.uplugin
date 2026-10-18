@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 1,
-  "VersionName": "1.0.0",
+  "Version": 3,
+  "VersionName": "1.2.0",
   "FriendlyName": "CubeShot",
   "Description": "Captures six directional texture views of a static mesh from the Unreal Editor.",
   "Category": "Tools",
@@ -9,6 +9,12 @@
   "CanContainContent": false,
   "IsBetaVersion": true,
   "EnabledByDefault": true,
+  "Plugins": [
+    {
+      "Name": "ModelContextProtocol",
+      "Enabled": true
+    }
+  ],
   "Modules": [
     {
       "Name": "CubeShot",

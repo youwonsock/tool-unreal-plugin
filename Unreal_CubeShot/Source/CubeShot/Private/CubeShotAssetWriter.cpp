@@ -1,6 +1,7 @@
 #include "CubeShotAssetWriter.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Async/Async.h"
 #include "ContentBrowserModule.h"
 #include "CubeShotCaptureService.h"
 #include "Editor/UnrealEdEngine.h"
@@ -215,9 +216,19 @@ bool FCubeShotAssetWriter::ValidateOutputRoot(FText& OutError) const
         return false;
     }
 
+    OutError = FText::GetEmpty();
+    return true;
+}
+
+bool FCubeShotAssetWriter::ValidateOutputPermissions(FText& OutError) const
+{
+    if (!ValidateOutputRoot(OutError)) return false;
+    FString ProbeFilename;
+    if (!FPackageName::TryConvertLongPackageNameToFilename(Config.OutputRoot / TEXT("CubeShotWriteProbe"),
+        ProbeFilename,FPackageName::GetAssetPackageExtension())) return false;
     // Path conversion alone does not prove that the mounted Content directory is
     // writable. Probe the closest existing parent before any capture or UObject
-    // mutation so a read-only workspace fails during preflight.
+    // mutation so a read-only workspace fails during execution preparation.
     FString ProbeDirectory = FPaths::GetPath(ProbeFilename);
     while (!ProbeDirectory.IsEmpty() && !IFileManager::Get().DirectoryExists(*ProbeDirectory))
     {
@@ -241,6 +252,8 @@ bool FCubeShotAssetWriter::ValidateOutputRoot(FText& OutError) const
     const FString WriteProbePath = ProbeDirectory / FString::Printf(
         TEXT(".cubeshot_write_probe_%s.tmp"),
         *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+    if (Config.ShouldFailOperation && Config.ShouldFailOperation(TEXT("write_probe"),WriteProbePath))
+    { OutError=FText::FromString(TEXT("Output directory permission probe failed: ")+ProbeDirectory);return false; }
     TUniquePtr<FArchive> WriteProbe(IFileManager::Get().CreateFileWriter(*WriteProbePath));
     if (!WriteProbe.IsValid())
     {
@@ -479,6 +492,7 @@ FString FCubeShotAssetWriter::CreateStagingDirectory(FText& OutError) const
 
 bool FCubeShotAssetWriter::DeleteStagingDirectory(const FString& StagingDirectory) const
 {
+    if (Config.ShouldFailOperation && Config.ShouldFailOperation(TEXT("stage_cleanup"), StagingDirectory)) return false;
     const FString Root = GetResolvedStagingRoot();
     const FString FullDirectory = FPaths::ConvertRelativePathToFull(StagingDirectory);
     if (FullDirectory.IsEmpty() || FullDirectory == Root || !FPaths::IsUnderDirectory(FullDirectory, Root))
@@ -486,106 +500,6 @@ bool FCubeShotAssetWriter::DeleteStagingDirectory(const FString& StagingDirector
         return false;
     }
     return IFileManager::Get().DeleteDirectory(*FullDirectory, false, true);
-}
-
-bool FCubeShotAssetWriter::StageCaptures(
-    const FCubeShotOptions& Options,
-    const FCubeShotCaptureCallback& Capture,
-    const TArray<FCubeShotOutputDescriptor>& Outputs,
-    const FString& StagingDirectory,
-    const FCubeShotProgressCallback& Progress,
-    const FCubeShotCancelCallback& ShouldCancel,
-    TArray<FString>& OutStagedFilenames,
-    FCubeShotGenerationResult& OutResult) const
-{
-    OutStagedFilenames.Reset();
-    OutStagedFilenames.Reserve(Outputs.Num());
-
-    if (Progress)
-    {
-        Progress(0, Outputs.Num(), LOCTEXT("StartingCapture", "Preparing six CubeShot captures..."));
-    }
-
-    for (int32 Index = 0; Index < Outputs.Num(); ++Index)
-    {
-        if (ShouldCancel && ShouldCancel())
-        {
-            OutResult.bCancelled = true;
-            OutResult.Message = LOCTEXT("CaptureCancelled", "CubeShot generation was cancelled before any asset was changed.");
-            return false;
-        }
-
-        const FCubeShotOutputDescriptor& Output = Outputs[Index];
-        FCubeShotImage CapturedImage;
-        FText CaptureError;
-        if (!Capture || !Capture(
-            Options,
-            Output.Direction,
-            Options.Resolution,
-            CapturedImage,
-            CaptureError)
-            || !CapturedImage.IsValid())
-        {
-            OutResult.Message = CaptureError.IsEmpty()
-                ? LOCTEXT("InvalidCapturedImage", "CubeShot returned an invalid captured image.")
-                : CaptureError;
-            return false;
-        }
-
-        FImage StagingImage;
-        StagingImage.Init(CapturedImage.Width, CapturedImage.Height, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
-        FMemory::Memcpy(
-            StagingImage.RawData.GetData(),
-            CapturedImage.Pixels.GetData(),
-            CapturedImage.Pixels.Num() * sizeof(FColor));
-        CapturedImage.Reset();
-
-        const FString Filename = DirectionStagingFilename(StagingDirectory, Index, Output);
-        if (!FImageUtils::SaveImageByExtension(*Filename, StagingImage, 100))
-        {
-            OutResult.Message = FText::Format(
-                LOCTEXT("StageWriteFailed", "Failed to write lossless staging image: {0}"),
-                FText::FromString(Filename));
-            return false;
-        }
-        StagingImage.RawData.Reset();
-
-        // Read back once before the mutation boundary so a corrupt staging file cannot cause a partial update later.
-        FImage ValidationImage;
-        if (!FImageUtils::LoadImage(*Filename, ValidationImage)
-            || ValidationImage.SizeX != Options.Resolution
-            || ValidationImage.SizeY != Options.Resolution
-            || ValidationImage.NumSlices != 1)
-        {
-            OutResult.Message = FText::Format(
-                LOCTEXT("StageValidationFailed", "Staging image could not be validated: {0}"),
-                FText::FromString(Filename));
-            return false;
-        }
-        ValidationImage.RawData.Reset();
-        OutStagedFilenames.Add(Filename);
-
-        if (Progress)
-        {
-            Progress(
-                Index + 1,
-                Outputs.Num(),
-                FText::Format(
-                    LOCTEXT("CapturedDirection", "Captured {0} ({1}/{2})"),
-                    FText::FromString(CubeShot::GetDirectionInfo(Output.Direction).Label),
-                    Index + 1,
-                    Outputs.Num()));
-        }
-    }
-
-    if (ShouldCancel && ShouldCancel())
-    {
-        OutResult.bCancelled = true;
-        OutResult.Message = LOCTEXT("CancelledAfterCapture", "CubeShot generation was cancelled before any asset was changed.");
-        return false;
-    }
-
-    return true;
 }
 
 bool FCubeShotAssetWriter::CheckoutExistingPackages(
@@ -619,7 +533,7 @@ bool FCubeShotAssetWriter::CheckoutExistingPackages(
                 FText::FromString(Output.LongPackageName));
             return false;
         }
-        ExistingPackages.Add(Package);
+        ExistingPackages.AddUnique(Package);
     }
 
     if (ExistingPackages.IsEmpty())
@@ -629,6 +543,18 @@ bool FCubeShotAssetWriter::CheckoutExistingPackages(
 
     if (Config.bPromptForCheckout)
     {
+        if (Config.CheckoutCallback)
+        {
+            if (!Config.CheckoutCallback(ExistingPackages, OutError))
+            { if (OutError.IsEmpty()) OutError=LOCTEXT("InjectedCheckoutCancelled","Checkout was cancelled."); return false; }
+            for (UPackage* Package : ExistingPackages)
+            {
+                const FString Filename=FPackageName::LongPackageNameToFilename(Package->GetName(),FPackageName::GetAssetPackageExtension());
+                if (IFileManager::Get().IsReadOnly(*Filename))
+                {OutError=FText::FromString(TEXT("Checkout incomplete: ")+Package->GetName());return false;}
+            }
+            return true;
+        }
         TArray<UPackage*> CheckedOutOrWritable;
         TArray<UPackage*> NotNeedingCheckout;
         if (!FEditorFileUtils::PromptToCheckoutPackages(
@@ -694,6 +620,23 @@ bool FCubeShotAssetWriter::CheckoutExistingPackages(
         }
     }
     return true;
+}
+
+bool FCubeShotAssetWriter::CheckoutForInteractiveSubmission(const TArray<FCubeShotOutputDescriptor>& Outputs, FText& Error) const
+{
+    check(IsInGameThread());
+    return CheckoutExistingPackages(Outputs, Error);
+}
+
+void FCubeShotAssetWriter::FinalizeStaging(FCubeShotGenerationResult& Result) const
+{
+    if (Result.StagingDirectory.IsEmpty()) return;
+    if (DeleteStagingDirectory(Result.StagingDirectory))
+    {
+        Result.StagingDirectory.Reset();
+        Result.StagedFilenames.Reset();
+    }
+    else Result.Warnings.AddUnique(TEXT("Staging cleanup failed; recovery images remain at ") + Result.StagingDirectory);
 }
 
 bool FCubeShotAssetWriter::ApplyImageToTexture(
@@ -822,7 +765,8 @@ void FCubeShotAssetWriter::SavePreparedAssets(
         SaveArgs.SaveFlags = SAVE_NoError;
         SaveArgs.Error = GError;
 
-        if (UPackage::SavePackage(Prepared.Package, Prepared.Texture, *PackageFilename, SaveArgs))
+        if (!(Config.ShouldFailOperation && Config.ShouldFailOperation(TEXT("package_save"), PackageFilename))
+            && UPackage::SavePackage(Prepared.Package, Prepared.Texture, *PackageFilename, SaveArgs))
         {
             OutResult.SavedObjectPaths.Add(Prepared.Descriptor.GetObjectPath());
         }
@@ -831,6 +775,7 @@ void FCubeShotAssetWriter::SavePreparedAssets(
             // The package intentionally remains dirty and staging is retained for manual recovery.
             Prepared.Package->SetDirtyFlag(true);
             OutResult.FailedObjectPaths.Add(Prepared.Descriptor.GetObjectPath());
+            OutResult.Errors.Add(TEXT("Package save failed: ") + PackageFilename);
         }
     }
 }
@@ -863,16 +808,12 @@ void FCubeShotAssetWriter::Execute(
     const FCubeShotCancelCallback& ShouldCancel,
     FCubeShotGenerationResult& OutResult) const
 {
-    const FCubeShotCaptureCallback Capture = [&CaptureService](
-        const FCubeShotOptions& CaptureOptions,
-        const ECubeShotDirection Direction,
-        const int32 TargetResolution,
-        FCubeShotImage& OutImage,
-        FText& OutError)
+    TUniquePtr<FExecution> Execution=BeginPreparedExecution(Options,[&CaptureService](const FCubeShotOptions& InOptions,ECubeShotDirection Direction,int32 Resolution,FCubeShotPixelWork& Work,FText& Error)
     {
-        return CaptureService.CaptureAndComposite(CaptureOptions, Direction, TargetResolution, OutImage, OutError);
-    };
-    ExecuteInternal(Options, Capture, Preflight, bOverwriteConfirmed, Progress, ShouldCancel, OutResult);
+        return CaptureService.PrepareCaptureWork(InOptions,Direction,Resolution,Work,Error);
+    },Preflight,bOverwriteConfirmed,Progress,ShouldCancel);
+    while(!Execution->Step(true)){}
+    OutResult=Execution->GetResult();
 }
 
 void FCubeShotAssetWriter::ExecuteWithCaptureCallback(
@@ -887,143 +828,193 @@ void FCubeShotAssetWriter::ExecuteWithCaptureCallback(
     ExecuteInternal(Options, Capture, Preflight, bOverwriteConfirmed, Progress, ShouldCancel, OutResult);
 }
 
-void FCubeShotAssetWriter::ExecuteInternal(
-    const FCubeShotOptions& Options,
-    const FCubeShotCaptureCallback& Capture,
-    const FCubeShotPreflightResult& Preflight,
-    const bool bOverwriteConfirmed,
-    const FCubeShotProgressCallback& Progress,
-    const FCubeShotCancelCallback& ShouldCancel,
-    FCubeShotGenerationResult& OutResult) const
+namespace
 {
-    OutResult = FCubeShotGenerationResult();
+    struct FStagePixelsResult { bool bSucceeded=false; FString Filename; FString Error; };
+    FStagePixelsResult WriteOwnedPixels(FCubeShotPixelWork Work, FString Filename, int32 Resolution,
+        TFunction<bool(const FString&,const FString&)> ShouldFail)
+    {
+        FStagePixelsResult Result; Result.Filename=Filename; FCubeShotImage Captured; FText Error;
+        if (!Work || !Work(Captured,Error) || !Captured.IsValid())
+        { Result.Error=Error.IsEmpty()?TEXT("Captured pixels are invalid."):Error.ToString();return Result; }
+        FImage Image;Image.Init(Captured.Width,Captured.Height,ERawImageFormat::BGRA8,EGammaSpace::sRGB);
+        FMemory::Memcpy(Image.RawData.GetData(),Captured.Pixels.GetData(),Captured.Pixels.Num()*sizeof(FColor));Captured.Reset();
+        if ((ShouldFail&&ShouldFail(TEXT("stage_write"),Filename)) || !FImageUtils::SaveImageByExtension(*Filename,Image,100))
+        { Result.Error=TEXT("Staging PNG write failed: ")+Filename;return Result; }
+        Image.RawData.Reset();FImage Validation;
+        if(!FImageUtils::LoadImage(*Filename,Validation)||Validation.SizeX!=Resolution||Validation.SizeY!=Resolution||Validation.NumSlices!=1)
+        { Result.Error=TEXT("Staging PNG validation failed: ")+Filename;return Result; }
+        Result.bSucceeded=true;return Result;
+    }
+}
 
-    if (!Preflight.bCanProceed || Preflight.Outputs.Num() != static_cast<int32>(ECubeShotDirection::Count))
-    {
-        OutResult.Message = LOCTEXT("InvalidPreflight", "CubeShot preflight is missing or no longer valid.");
-        return;
-    }
-    if (Preflight.bHasExistingTextures && !bOverwriteConfirmed)
-    {
-        OutResult.Message = LOCTEXT("OverwriteNotConfirmed", "Existing CubeShot textures were not approved for overwrite.");
-        return;
-    }
+struct FCubeShotAssetWriter::FExecution::FState
+{
+    FCubeShotAssetWriter Writer;
+    FCubeShotOptions Options;
+    FCubeShotPrepareCaptureCallback Capture;
+    TFuture<FStagePixelsResult> PendingPixels;
+    FCubeShotPreflightResult Preflight;
+    FCubeShotProgressCallback Progress;
+    FCubeShotCancelCallback ShouldCancel;
+    FCubeShotGenerationResult Result;
+    TArray<FString> Staged;
+    int32 Face = 0;
+    int32 Stage = 0;
+    bool bOverwrite = false;
+    FState(const FCubeShotAssetWriter& InWriter) : Writer(InWriter) {}
 
-    FCubeShotPreflightResult FreshPreflight;
-    if (!BuildPreflight(Options, FreshPreflight)
-        || !FreshPreflight.bCanProceed
-        || !AreOutputsEqual(Preflight.Outputs, FreshPreflight.Outputs))
+    void FinishBeforeMutation()
     {
-        OutResult.Message = FreshPreflight.Error.IsEmpty()
-            ? LOCTEXT("InputsChanged", "CubeShot inputs or output paths changed after preflight.")
-            : FreshPreflight.Error;
-        return;
+        if (Writer.DeleteStagingDirectory(Result.StagingDirectory)) { Result.StagingDirectory.Reset(); Result.StagedFilenames.Reset(); }
+        else if (!Result.StagingDirectory.IsEmpty())
+            Result.Warnings.Add(TEXT("Staging cleanup failed; recovery images remain at ") + Result.StagingDirectory);
+        Stage = 3;
     }
-    if (FreshPreflight.bHasExistingTextures && !Preflight.bHasExistingTextures)
-    {
-        OutResult.Message = LOCTEXT("LateOverwriteCollision", "A CubeShot output appeared after preflight. Run Generate again to review the overwrite warning.");
-        return;
-    }
+};
 
-    FText StagingError;
-    OutResult.StagingDirectory = CreateStagingDirectory(StagingError);
-    if (OutResult.StagingDirectory.IsEmpty())
-    {
-        OutResult.Message = StagingError;
-        return;
-    }
+FCubeShotAssetWriter::FExecution::FExecution(TUniquePtr<FState> InState) : State(MoveTemp(InState)) {}
+FCubeShotAssetWriter::FExecution::~FExecution() { if (State->PendingPixels.IsValid()) State->PendingPixels.Wait(); }
+bool FCubeShotAssetWriter::FExecution::IsCritical() const { return State->Stage == 2; }
+FString FCubeShotAssetWriter::FExecution::GetStage() const
+{
+    if (State->Stage == 0) return TEXT("validate");
+    if (State->Stage == 4) return TEXT("stage_png");
+    if (State->Stage == 1) return FString::Printf(TEXT("capture_%s"), CubeShot::GetDirectionInfo(static_cast<ECubeShotDirection>(State->Face)).Label);
+    return State->Stage == 2 ? TEXT("package_commit") : TEXT("complete");
+}
+const FCubeShotGenerationResult& FCubeShotAssetWriter::FExecution::GetResult() const { return State->Result; }
 
-    TArray<FString> StagedFilenames;
-    if (!StageCaptures(
-        Options,
-        Capture,
-        FreshPreflight.Outputs,
-        OutResult.StagingDirectory,
-        Progress,
-        ShouldCancel,
-        StagedFilenames,
-        OutResult))
+bool FCubeShotAssetWriter::FExecution::Step(bool bInlineMode)
+{
+    FState& S = *State;
+    if (S.Stage == 3) return true;
+    if (S.Stage == 0)
     {
-        DeleteStagingDirectory(OutResult.StagingDirectory);
-        OutResult.StagingDirectory.Reset();
-        return;
+        if (!S.Preflight.bCanProceed || S.Preflight.Outputs.Num() != 6)
+        { S.Result.Message = LOCTEXT("InvalidPreflight", "CubeShot preflight is missing or invalid."); S.Result.ErrorCode = TEXT("preflight_failed"); S.Stage = 3; return true; }
+        FCubeShotPreflightResult Fresh;
+        if (!S.Writer.BuildPreflight(S.Options, Fresh) || !AreOutputsEqual(S.Preflight.Outputs, Fresh.Outputs))
+        { S.Result.Message = Fresh.Error; S.Result.ErrorCode = TEXT("preflight_failed"); S.Stage = 3; return true; }
+        if (Fresh.bHasExistingTextures && !S.bOverwrite)
+        { S.Result.Message = LOCTEXT("OverwriteNotConfirmed", "Existing CubeShot textures were not approved for overwrite."); S.Result.ErrorCode = TEXT("overwrite_required"); S.Stage = 3; return true; }
+        if (Fresh.bHasExistingTextures && !S.Preflight.bHasExistingTextures)
+        { S.Result.Message = LOCTEXT("LateOverwriteCollision", "An output appeared after preflight. Review overwrite again."); S.Result.ErrorCode = TEXT("output_changed"); S.Stage = 3; return true; }
+        S.Preflight = MoveTemp(Fresh);
+        if (!S.Writer.ValidateOutputPermissions(S.Result.Message))
+        { S.Result.ErrorCode=TEXT("output_not_writable");S.Stage=3;return true; }
+        S.Result.StagingDirectory = S.Writer.CreateStagingDirectory(S.Result.Message);
+        if (S.Result.StagingDirectory.IsEmpty()) { S.Result.ErrorCode = TEXT("staging_failed"); S.Stage = 3; return true; }
+        S.Stage = 1;
+        return false;
     }
-
-    // Close the time-of-check/time-of-use gap before the UObject mutation boundary.
-    FCubeShotPreflightResult PostCapturePreflight;
-    if (!BuildPreflight(Options, PostCapturePreflight)
-        || !AreOutputsEqual(FreshPreflight.Outputs, PostCapturePreflight.Outputs)
-        || (PostCapturePreflight.bHasExistingTextures && !FreshPreflight.bHasExistingTextures))
+    if (S.Stage == 1)
     {
-        OutResult.Message = PostCapturePreflight.Error.IsEmpty()
-            ? LOCTEXT("CollisionDuringCapture", "An output package changed while CubeShot was capturing.")
-            : PostCapturePreflight.Error;
-        DeleteStagingDirectory(OutResult.StagingDirectory);
-        OutResult.StagingDirectory.Reset();
-        return;
+        if (S.ShouldCancel && S.ShouldCancel())
+        { S.Result.bCancelled=true;S.Result.ErrorCode=TEXT("cancelled");S.Result.Message=LOCTEXT("CaptureCancelled","Cancelled before output mutation.");S.FinishBeforeMutation();return true; }
+        FCubeShotPixelWork Work; FText Error;
+        if (!S.Capture || !S.Capture(S.Options,S.Preflight.Outputs[S.Face].Direction,S.Options.Resolution,Work,Error))
+        { S.Result.Message=Error;S.Result.ErrorCode=TEXT("capture_failed");S.Result.FailedObjectPaths.Add(S.Preflight.Outputs[S.Face].GetObjectPath());S.Result.Errors.Add(Error.ToString());S.FinishBeforeMutation();return true; }
+        const FString Filename=DirectionStagingFilename(S.Result.StagingDirectory,S.Face,S.Preflight.Outputs[S.Face]);
+        if (bInlineMode)
+        {
+            TPromise<FStagePixelsResult> Promise; S.PendingPixels=Promise.GetFuture();
+            Promise.SetValue(WriteOwnedPixels(MoveTemp(Work),Filename,S.Options.Resolution,S.Writer.Config.ShouldFailOperation));
+        }
+        else
+        {
+            S.PendingPixels=Async(EAsyncExecution::ThreadPool,[Work=MoveTemp(Work),Filename,Resolution=S.Options.Resolution,Fail=S.Writer.Config.ShouldFailOperation]() mutable
+                { return WriteOwnedPixels(MoveTemp(Work),Filename,Resolution,MoveTemp(Fail)); });
+        }
+        S.Stage=4;
+        if(!bInlineMode)return false;
     }
-
-    FText CheckoutError;
-    if (!CheckoutExistingPackages(PostCapturePreflight.Outputs, CheckoutError))
+    if (S.Stage == 4)
     {
-        OutResult.Message = CheckoutError;
-        DeleteStagingDirectory(OutResult.StagingDirectory);
-        OutResult.StagingDirectory.Reset();
-        return;
+        if (!S.PendingPixels.IsReady()) return false;
+        FStagePixelsResult Written=S.PendingPixels.Get();S.PendingPixels=TFuture<FStagePixelsResult>();
+        if (!Written.bSucceeded)
+        { S.Result.Message=FText::FromString(Written.Error);S.Result.ErrorCode=TEXT("staging_failed");S.Result.Errors.Add(Written.Error);S.Result.FailedObjectPaths.Add(S.Preflight.Outputs[S.Face].GetObjectPath());S.FinishBeforeMutation();return true; }
+        S.Staged.Add(Written.Filename);S.Result.StagedFilenames.Add(Written.Filename);++S.Face;S.Result.StagedFaces=S.Face;
+        if(S.Progress)S.Progress(S.Face,6,FText::Format(LOCTEXT("FaceProgress","Staged {0}/6 directions"),S.Face));
+        if(S.ShouldCancel && S.ShouldCancel())
+        { S.Result.bCancelled=true;S.Result.ErrorCode=TEXT("cancelled");S.Result.Message=LOCTEXT("CancelStagingFuture","Cancelled after the pending pixel/PNG worker completed, before output mutation.");S.FinishBeforeMutation();return true; }
+        S.Stage=S.Face==6?2:1;return false;
     }
-
+    // Critical section: after the final cancellation poll, finish all six package writes.
+    if (S.ShouldCancel && S.ShouldCancel())
+    { S.Result.bCancelled = true; S.Result.ErrorCode = TEXT("cancelled"); S.Result.Message = LOCTEXT("CancelledAfterCapture", "Cancelled before any output asset was changed."); S.FinishBeforeMutation(); return true; }
+    FCubeShotPreflightResult Fresh;
+    if (!S.Writer.BuildPreflight(S.Options, Fresh) || !AreOutputsEqual(S.Preflight.Outputs, Fresh.Outputs)
+        || (Fresh.bHasExistingTextures && !S.Preflight.bHasExistingTextures))
+    { S.Result.Message = Fresh.Error.IsEmpty() ? LOCTEXT("CollisionDuringCapture", "An output changed during capture.") : Fresh.Error; S.Result.ErrorCode = TEXT("output_changed"); S.FinishBeforeMutation(); return true; }
+    if (!S.Writer.CheckoutExistingPackages(Fresh.Outputs, S.Result.Message))
+    { S.Result.ErrorCode = TEXT("checkout_failed"); S.FinishBeforeMutation(); return true; }
     TArray<FPreparedAsset> PreparedAssets;
-    PreparedAssets.Reserve(PostCapturePreflight.Outputs.Num());
-    for (int32 Index = 0; Index < PostCapturePreflight.Outputs.Num(); ++Index)
+    for (int32 Index = 0; Index < Fresh.Outputs.Num(); ++Index)
     {
-        FPreparedAsset Prepared;
-        FText PrepareError;
-        if (PrepareAsset(PostCapturePreflight.Outputs[Index], StagedFilenames[Index], Prepared, PrepareError))
-        {
-            PreparedAssets.Add(MoveTemp(Prepared));
-        }
+        FPreparedAsset Prepared; FText PrepareError;
+        if (S.Writer.PrepareAsset(Fresh.Outputs[Index], S.Staged[Index], Prepared, PrepareError)) PreparedAssets.Add(MoveTemp(Prepared));
         else
         {
-            OutResult.FailedObjectPaths.Add(PostCapturePreflight.Outputs[Index].GetObjectPath());
-            if (OutResult.Message.IsEmpty())
-            {
-                OutResult.Message = PrepareError;
-            }
+            S.Result.FailedObjectPaths.Add(Fresh.Outputs[Index].GetObjectPath());
+            S.Result.Errors.Add(PrepareError.ToString());
         }
     }
-
-    SavePreparedAssets(PreparedAssets, OutResult);
-    OutResult.bSucceeded = OutResult.FailedObjectPaths.IsEmpty()
-        && OutResult.SavedObjectPaths.Num() == PostCapturePreflight.Outputs.Num();
-
-    if (OutResult.bSucceeded)
+    S.Writer.SavePreparedAssets(PreparedAssets, S.Result);
+    for (const FCubeShotOutputDescriptor& Output : Fresh.Outputs)
+        if (UPackage* Package = FindPackage(nullptr, *Output.LongPackageName); Package && Package->IsDirty())
+            S.Result.DirtyPackages.AddUnique(Output.LongPackageName);
+    S.Result.bSucceeded = S.Result.FailedObjectPaths.IsEmpty() && S.Result.SavedObjectPaths.Num() == 6;
+    if (S.Result.bSucceeded)
     {
-        if (Config.bSyncContentBrowserOnSuccess)
-        {
-            SyncContentBrowser(PreparedAssets);
-        }
-        if (DeleteStagingDirectory(OutResult.StagingDirectory))
-        {
-            OutResult.StagingDirectory.Reset();
-            OutResult.Message = LOCTEXT("GenerationSucceeded", "Generated and saved all six CubeShot textures.");
-        }
-        else
-        {
-            OutResult.Message = FText::Format(
-                LOCTEXT("GenerationSucceededCleanupFailed", "Generated all six textures, but the staging directory could not be removed: {0}"),
-                FText::FromString(OutResult.StagingDirectory));
-        }
+        if (S.Writer.Config.bSyncContentBrowserOnSuccess) S.Writer.SyncContentBrowser(PreparedAssets);
+        S.Result.Message = LOCTEXT("GenerationSucceeded", "Generated and saved all six CubeShot textures.");
+        if (S.Writer.Config.bRetainSuccessfulStaging) S.Stage = 3;
+        else S.FinishBeforeMutation();
     }
     else
     {
-        OutResult.Message = FText::Format(
-            LOCTEXT(
-                "PartialSaveFailure",
-                "CubeShot saved {0} texture(s) and failed {1}. Failed packages remain dirty and staging was kept at {2}."),
-            OutResult.SavedObjectPaths.Num(),
-            OutResult.FailedObjectPaths.Num(),
-            FText::FromString(OutResult.StagingDirectory));
+        S.Result.ErrorCode = TEXT("partial_save");
+        S.Result.Message = FText::Format(LOCTEXT("PartialSaveFailure", "Saved {0}; failed {1}. Dirty packages and staging images require review at {2}."), S.Result.SavedObjectPaths.Num(), S.Result.FailedObjectPaths.Num(), FText::FromString(S.Result.StagingDirectory));
+        S.Stage = 3;
     }
+    return true;
+}
+
+TUniquePtr<FCubeShotAssetWriter::FExecution> FCubeShotAssetWriter::BeginPreparedExecution(
+    const FCubeShotOptions& Options, FCubeShotPrepareCaptureCallback Capture,
+    const FCubeShotPreflightResult& Preflight, bool bOverwriteConfirmed,
+    FCubeShotProgressCallback Progress, FCubeShotCancelCallback ShouldCancel) const
+{
+    // ImageWrapper must be loaded on the game thread before independent CPU workers start.
+    FModuleManager::LoadModuleChecked<IModuleInterface>(TEXT("ImageWrapper"));
+    TUniquePtr<FExecution::FState> State=MakeUnique<FExecution::FState>(*this);
+    State->Options=Options;State->Capture=MoveTemp(Capture);State->Preflight=Preflight;
+    State->bOverwrite=bOverwriteConfirmed;State->Progress=MoveTemp(Progress);State->ShouldCancel=MoveTemp(ShouldCancel);
+    return TUniquePtr<FExecution>(new FExecution(MoveTemp(State)));
+}
+
+TUniquePtr<FCubeShotAssetWriter::FExecution> FCubeShotAssetWriter::BeginExecution(
+    const FCubeShotOptions& Options, const FCubeShotCaptureCallback& Capture,
+    const FCubeShotPreflightResult& Preflight, bool bOverwriteConfirmed,
+    FCubeShotProgressCallback Progress, FCubeShotCancelCallback ShouldCancel) const
+{
+    return BeginPreparedExecution(Options,[Capture](const FCubeShotOptions& InOptions,ECubeShotDirection Direction,int32 Resolution,FCubeShotPixelWork& Work,FText& Error)
+    {
+        FCubeShotImage Captured;if(!Capture||!Capture(InOptions,Direction,Resolution,Captured,Error))return false;
+        Work=[Captured=MoveTemp(Captured)](FCubeShotImage& Image,FText&) mutable {Image=MoveTemp(Captured);return Image.IsValid();};return true;
+    },Preflight,bOverwriteConfirmed,MoveTemp(Progress),MoveTemp(ShouldCancel));
+}
+
+void FCubeShotAssetWriter::ExecuteInternal(const FCubeShotOptions& Options,
+    const FCubeShotCaptureCallback& Capture, const FCubeShotPreflightResult& Preflight,
+    const bool bOverwriteConfirmed, const FCubeShotProgressCallback& Progress,
+    const FCubeShotCancelCallback& ShouldCancel, FCubeShotGenerationResult& OutResult) const
+{
+    TUniquePtr<FExecution> Execution = BeginExecution(Options, Capture, Preflight, bOverwriteConfirmed, Progress, ShouldCancel);
+    while (!Execution->Step()) {}
+    OutResult = Execution->GetResult();
 }
 
 #undef LOCTEXT_NAMESPACE

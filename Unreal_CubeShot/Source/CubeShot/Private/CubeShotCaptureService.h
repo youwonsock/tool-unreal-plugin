@@ -49,6 +49,10 @@ public:
         int32 TargetResolution,
         FCubeShotImage& OutImage,
         FText& OutError);
+    bool PrepareCompositeWork(FCubeShotRawFrame RawFrame, const FCubeShotOptions& Options,
+        int32 TargetResolution, FCubeShotPixelWork& OutWork, FText& OutError);
+    bool PrepareCaptureWork(const FCubeShotOptions& Options, ECubeShotDirection Direction,
+        int32 TargetResolution, FCubeShotPixelWork& OutWork, FText& OutError);
 
     void Shutdown();
 
@@ -72,13 +76,15 @@ private:
     void ConfigureCaptureComponent();
     void ApplyCamera(ECubeShotDirection Direction);
     void ApplyCameraRelativeLighting(ECubeShotDirection Direction);
+    bool ResolveBackground(const FCubeShotOptions& Options, int32 TargetResolution,
+        TSharedPtr<const FImage>& OutImage, FText& OutError);
 
 private:
     TUniquePtr<FPreviewScene> PreviewScene;
     UStaticMeshComponent* MeshComponent = nullptr;
     USceneCaptureComponent2D* CaptureComponent = nullptr;
     TStrongObjectPtr<UTextureRenderTarget2D> RenderTarget;
-    TUniquePtr<FImage> CachedBackgroundImage;
+    TSharedPtr<FImage> CachedBackgroundImage;
     TWeakObjectPtr<UTexture2D> CachedBackgroundTexture;
     FGuid CachedBackgroundSourceId;
     int32 CachedBackgroundResolution = 0;

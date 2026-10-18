@@ -1,6 +1,7 @@
 #include "CubeShotModule.h"
 
 #include "SCubeShotPanel.h"
+#include "CubeShotMcpTools.h"
 
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Docking/TabManager.h"
@@ -17,6 +18,7 @@ namespace
 
 void FCubeShotModule::StartupModule()
 {
+	CubeShot::Mcp::Register();
 	FGlobalTabmanager::Get()->RegisterNomadTabSpawner(
 		CubeShotTabName,
 		FOnSpawnTab::CreateRaw(this, &FCubeShotModule::SpawnCubeShotTab))
@@ -38,6 +40,7 @@ void FCubeShotModule::ShutdownModule()
 	UToolMenus::UnRegisterStartupCallback(this);
 	UToolMenus::UnregisterOwner(this);
 	CloseCubeShotTab();
+	CubeShot::Mcp::Unregister();
 	FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(CubeShotTabName);
 }
 

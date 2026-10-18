@@ -2,9 +2,29 @@
 
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
+#include "Materials/MaterialInterface.h"
 #include "StaticMeshResources.h"
+#include "Editor.h"
+#include "Misc/App.h"
+#include "RHIGlobals.h"
 
 #define LOCTEXT_NAMESPACE "CubeShotTypes"
+
+bool CubeShot::CanExecute(FText& OutError)
+{
+    return EvaluateExecutionPolicy(GEditor != nullptr, GEditor && GEditor->PlayWorld,
+        GEditor && GEditor->bIsSimulatingInEditor, FApp::CanEverRender(), GUsingNullRHI,
+        GDynamicRHI != nullptr, OutError);
+}
+bool CubeShot::EvaluateExecutionPolicy(bool bEditor, bool bPIE, bool bSIE, bool bCanRender,
+    bool bNullRhi, bool bRhiPresent, FText& OutError)
+{
+    if (!bEditor) OutError = LOCTEXT("NoEditor", "CubeShot requires an Editor world.");
+    else if (bPIE || bSIE) OutError = LOCTEXT("PlayBlocked", "Stop PIE or SIE before CubeShot capture.");
+    else if (!bCanRender || bNullRhi || !bRhiPresent) OutError = LOCTEXT("NoRendering", "CubeShot requires a rendering Editor (no -nullrhi).");
+    else { OutError = FText::GetEmpty(); return true; }
+    return false;
+}
 
 namespace
 {
@@ -33,6 +53,36 @@ const FCubeShotDirectionInfo& CubeShot::GetDirectionInfo(const ECubeShotDirectio
 bool CubeShot::IsPowerOfTwoResolution(const int32 Resolution)
 {
     return Resolution > 0 && FMath::IsPowerOfTwo(Resolution);
+}
+
+bool CubeShot::ValidateBounds(const FBoxSphereBounds& Bounds, FText& OutError)
+{
+    const bool Finite=FMath::IsFinite(Bounds.Origin.X)&&FMath::IsFinite(Bounds.Origin.Y)&&FMath::IsFinite(Bounds.Origin.Z)
+        &&FMath::IsFinite(Bounds.BoxExtent.X)&&FMath::IsFinite(Bounds.BoxExtent.Y)&&FMath::IsFinite(Bounds.BoxExtent.Z)
+        &&FMath::IsFinite(Bounds.SphereRadius);
+    if(!Finite||Bounds.BoxExtent.X<0||Bounds.BoxExtent.Y<0||Bounds.BoxExtent.Z<0
+        ||Bounds.SphereRadius<0||Bounds.BoxExtent.GetMax()<=UE_SMALL_NUMBER)
+    {OutError=LOCTEXT("InvalidMeshBounds","The mesh has invalid or empty bounds.");return false;}
+    OutError=FText::GetEmpty();return true;
+}
+
+bool CubeShot::ValidateBoundsAndCamera(const FBoxSphereBounds& Bounds,const FCubeShotOptions& Options,FText& OutError)
+{
+    if(!ValidateBounds(Bounds,OutError))return false;
+    if(!FMath::IsFinite(Options.CameraDistance)||Options.CameraDistance<=0)
+    {OutError=LOCTEXT("InvalidDistance","Camera Distance must be greater than zero.");return false;}
+    if(!FMath::IsFinite(Options.FieldOfView)||Options.FieldOfView<1||Options.FieldOfView>170)
+    {OutError=LOCTEXT("InvalidFov","FOV must be between 1 and 170 degrees.");return false;}
+    if(!FMath::IsFinite(Options.OrthoWidth)||Options.OrthoWidth<=0)
+    {OutError=LOCTEXT("InvalidOrthoWidth","Ortho Width must be greater than zero.");return false;}
+    const double MinimumDistance=Bounds.BoxExtent.GetMax()+MinimumNearPlane;
+    if(!Options.bAutoFit&&Options.CameraDistance<=MinimumDistance)
+    {
+        OutError=FText::Format(LOCTEXT("ManualCameraInsideBounds",
+            "Camera Distance must be greater than {0} cm so every view remains in front of the near plane."),FText::AsNumber(MinimumDistance));
+        return false;
+    }
+    OutError=FText::GetEmpty();return true;
 }
 
 bool CubeShot::ValidateBackgroundTextureSource(
@@ -104,17 +154,7 @@ bool CubeShot::ValidateOptions(const FCubeShotOptions& Options, FText& OutError,
     }
 
     const FBoxSphereBounds Bounds = Options.StaticMesh->GetBounds();
-    const bool bFiniteBounds = FMath::IsFinite(Bounds.Origin.X)
-        && FMath::IsFinite(Bounds.Origin.Y)
-        && FMath::IsFinite(Bounds.Origin.Z)
-        && FMath::IsFinite(Bounds.BoxExtent.X)
-        && FMath::IsFinite(Bounds.BoxExtent.Y)
-        && FMath::IsFinite(Bounds.BoxExtent.Z);
-    if (!bFiniteBounds || Bounds.BoxExtent.GetMax() <= UE_SMALL_NUMBER)
-    {
-        OutError = LOCTEXT("InvalidMeshBounds", "The mesh has invalid or empty bounds.");
-        return false;
-    }
+    if(!ValidateBoundsAndCamera(Bounds,Options,OutError))return false;
 
     if (Options.BackgroundMode == ECubeShotBackgroundMode::Texture
         && !ValidateBackgroundTextureSource(Options.BackgroundTexture, false, OutError))
@@ -128,27 +168,31 @@ bool CubeShot::ValidateOptions(const FCubeShotOptions& Options, FText& OutError,
         return false;
     }
 
-    if (!FMath::IsFinite(Options.CameraDistance) || Options.CameraDistance <= 0.0)
-    {
-        OutError = LOCTEXT("InvalidDistance", "Camera Distance must be greater than zero.");
-        return false;
-    }
-
-    if (!FMath::IsFinite(Options.FieldOfView) || Options.FieldOfView < 1.0 || Options.FieldOfView > 170.0)
-    {
-        OutError = LOCTEXT("InvalidFov", "FOV must be between 1 and 170 degrees.");
-        return false;
-    }
-
-    if (!FMath::IsFinite(Options.OrthoWidth) || Options.OrthoWidth <= 0.0)
-    {
-        OutError = LOCTEXT("InvalidOrthoWidth", "Ortho Width must be greater than zero.");
-        return false;
-    }
-
     if (!IsPowerOfTwoResolution(Options.Resolution))
     {
         OutWarning = LOCTEXT("NoMipWarning", "Non-power-of-two output keeps its exact size and is saved without mipmaps.");
+    }
+
+    if (Options.StaticMesh->GetNaniteSettings().bEnabled)
+    {
+        const FText NaniteWarning = LOCTEXT("NaniteFallbackWarning",
+            "CubeShot disables Nanite and captures the fallback LOD0 mesh. Its silhouette may differ from the Nanite view.");
+        OutWarning = OutWarning.IsEmpty() ? NaniteWarning
+            : FText::Format(LOCTEXT("CombinedNaniteWarning", "{0}\n{1}"), OutWarning, NaniteWarning);
+    }
+
+    // Keep the panel, asset writer and MCP preflight on the same material policy.
+    for (const FStaticMaterial& Slot : Options.StaticMesh->GetStaticMaterials())
+    {
+        const UMaterialInterface* Material = Slot.MaterialInterface;
+        if (Material && Material->GetBlendMode() != BLEND_Opaque && Material->GetBlendMode() != BLEND_Masked)
+        {
+            const FText MaterialWarning = LOCTEXT("BestEffortMaterialWarning",
+                "Translucent, additive, and refractive materials are captured on a best-effort basis. Inspect silhouette and alpha before using the result as an icon.");
+            OutWarning = OutWarning.IsEmpty() ? MaterialWarning
+                : FText::Format(LOCTEXT("CombinedWarning", "{0}\n{1}"), OutWarning, MaterialWarning);
+            break;
+        }
     }
 
     return true;

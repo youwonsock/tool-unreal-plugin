@@ -2,10 +2,11 @@
 #include "FBX_ExporterFbxMedia.h"
 
 #include "AssetExportTask.h"
+#include "Async/Async.h"
 #include "AssetRegistry/AssetData.h"
 #include "Components/StaticMeshComponent.h"
 #include "ContentBrowserMenuContexts.h"
-#include "DesktopPlatformModule.h"
+#include "Editor.h"
 #include "Engine/Engine.h"
 #include "Engine/EngineTypes.h"
 #include "Engine/StaticMesh.h"
@@ -14,9 +15,8 @@
 #include "Exporters/FbxExportOption.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/FileManager.h"
-#include "IDesktopPlatform.h"
+#include "HAL/PlatformMisc.h"
 #include "ImageUtils.h"
-#include "Interfaces/IMainFrameModule.h"
 #include "IMaterialBakingModule.h"
 #include "MaterialBakingStructures.h"
 #include "MaterialExpressionIO.h"
@@ -32,12 +32,16 @@
 #include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstance.h"
+#include "Materials/MaterialFunctionInterface.h"
 #include "Materials/MaterialParameters.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Misc/App.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
-#include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
+#include "RHIGlobals.h"
 #include "MeshDescription.h"
 #include "Modules/ModuleManager.h"
 #include "StaticMeshResources.h"
@@ -45,16 +49,9 @@
 #include "StaticMeshComponentAdapter.h"
 #include "ToolMenus.h"
 #include "UObject/Package.h"
-#include "Widgets/Input/SButton.h"
-#include "Widgets/Input/SCheckBox.h"
-#include "Widgets/Input/SComboBox.h"
-#include "Widgets/Input/SEditableTextBox.h"
-#include "Widgets/Layout/SUniformGridPanel.h"
-#include "Widgets/SBoxPanel.h"
-#include "Widgets/SWindow.h"
-#include "Widgets/Notifications/SNotificationList.h"
-#include "Widgets/Text/STextBlock.h"
-#include "Framework/Notifications/NotificationManager.h"
+#include "UObject/StrongObjectPtr.h"
+#include "Misc/SecureHash.h"
+#include "Misc/ScopeExit.h"
 
 #define LOCTEXT_NAMESPACE "FBX_Exporter"
 
@@ -62,6 +59,20 @@ namespace FBXExporter
 {
 namespace
 {
+	FString PublishFailurePoint;
+	bool WriteJournal(const FString& Path, const TSharedRef<FJsonObject>& Data)
+	{
+		FString Error;
+		return UnrealToolsRuntime::AtomicJson(Path, Data, Error);
+	}
+
+	TSharedPtr<FJsonObject> ReadJournal(const FString& Path)
+	{
+		FString Text; TSharedPtr<FJsonObject> Data;
+		if (!FFileHelper::LoadFileToString(Text, *Path) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Data)) return nullptr;
+		return Data;
+	}
+
 	constexpr TCHAR ConfigSection[] = TEXT("/Script/FBX_Exporter.FBX_ExporterSettings");
 	constexpr TCHAR LegacyHavenConfigSection[] = TEXT("/Script/HavenEditor.HavenStaticMeshTextureExportSettings");
 	constexpr TCHAR LegacyAssetImportConfigSection[] = TEXT("/Script/AssetImportProjectEditor.AssetImportProjectStaticMeshTextureExportSettings");
@@ -95,24 +106,6 @@ namespace
 		float EmissionScale = 1.0f;
 	};
 
-	struct FExportDialogState
-	{
-		bool bAccepted = false;
-		FString OutputRoot;
-		int32 BakeResolution = 2048;
-		bool bReuseDirectTextures = true;
-		EFBXExporterTextureMap TextureMaps = EFBXExporterTextureMap::All;
-		bool bEmbedTexturesInFbx = false;
-	};
-
-	struct FBatchExportSummary
-	{
-		int32 RequestedCount = 0;
-		int32 SucceededCount = 0;
-		FString OutputRoot;
-		TArray<FString> Warnings;
-		TArray<FString> Errors;
-	};
 
 	FString GetMapFileName(const FString& MaterialName, const FString& MapName)
 	{
@@ -255,12 +248,12 @@ namespace
 		return true;
 	}
 
-	bool LoadTexturePixels(
+	bool LoadTextureLinearPixels(
 		UTexture2D* Texture,
 		const int32 TargetWidth,
 		const int32 TargetHeight,
 		const bool bSourceSRGB,
-		TArray<FColor>& OutPixels)
+		TArray<FLinearColor>& OutPixels)
 	{
 		if (!Texture)
 		{
@@ -281,19 +274,17 @@ namespace
 			? (Texture->bUseLegacyGamma ? EGammaSpace::Pow22 : EGammaSpace::sRGB)
 			: EGammaSpace::Linear;
 		FImage ConvertedImage;
-		SourceImage.CopyTo(ConvertedImage, ERawImageFormat::BGRA8, EGammaSpace::Linear);
-
-		const TArrayView64<const FColor> ConvertedView = ConvertedImage.AsBGRA8();
-		TArray<FColor> ConvertedPixels;
-		ConvertedPixels.Append(ConvertedView.GetData(), static_cast<int32>(ConvertedView.Num()));
-		return ResizePixels(
-			ConvertedPixels,
-			ConvertedImage.SizeX,
-			ConvertedImage.SizeY,
-			false,
-			TargetWidth,
-			TargetHeight,
-			OutPixels);
+		SourceImage.CopyTo(ConvertedImage, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+		if (ConvertedImage.SizeX != TargetWidth || ConvertedImage.SizeY != TargetHeight)
+		{
+			FImage ResizedImage;
+			ConvertedImage.ResizeTo(ResizedImage, TargetWidth, TargetHeight, ERawImageFormat::RGBA32F, EGammaSpace::Linear);
+			ConvertedImage = MoveTemp(ResizedImage);
+		}
+		const TArrayView64<const FLinearColor> View = ConvertedImage.AsRGBA32F();
+		OutPixels.Reset();
+		OutPixels.Append(View.GetData(), static_cast<int32>(View.Num()));
+		return true;
 	}
 
 	enum class EDirectTextureChannel : uint8
@@ -312,42 +303,31 @@ namespace
 		EDirectTextureChannel Channel = EDirectTextureChannel::RGB;
 	};
 
-	bool LoadDirectTexturePixels(
+	bool LoadDirectTextureLinearPixels(
 		const FDirectTextureBinding& Binding,
 		const int32 TargetWidth,
 		const int32 TargetHeight,
-		const bool bSRGB,
-		TArray<FColor>& OutPixels)
+		TArray<FLinearColor>& OutPixels)
 	{
 		if (!Binding.Texture)
 		{
 			return false;
 		}
-		TArray<FColor> SourcePixels;
+		TArray<FLinearColor> SourcePixels;
 		// Decode according to the source texture's SRGB flag, then encode the
 		// generated PNG in its destination color space below.
-		if (!LoadTexturePixels(Binding.Texture, TargetWidth, TargetHeight, Binding.Texture->SRGB, SourcePixels))
+		if (!LoadTextureLinearPixels(Binding.Texture, TargetWidth, TargetHeight, Binding.Texture->SRGB, SourcePixels))
 		{
 			return false;
 		}
 		if (Binding.Channel == EDirectTextureChannel::RGB || Binding.Channel == EDirectTextureChannel::RGBA)
 		{
-			if (bSRGB)
-			{
-				for (FColor& Pixel : SourcePixels)
-				{
-					// LoadTexturePixels stores a quantized *linear* value.  The
-					// FLinearColor(FColor) constructor assumes sRGB input, so use
-					// the explicit linear reinterpretation before encoding.
-					Pixel = Pixel.ReinterpretAsLinear().ToFColorSRGB();
-				}
-			}
 			OutPixels = MoveTemp(SourcePixels);
 			return true;
 		}
-		for (FColor& Pixel : SourcePixels)
+		for (FLinearColor& Pixel : SourcePixels)
 		{
-			uint8 Value = Pixel.R;
+			float Value = Pixel.R;
 			switch (Binding.Channel)
 			{
 			case EDirectTextureChannel::G: Value = Pixel.G; break;
@@ -355,18 +335,31 @@ namespace
 			case EDirectTextureChannel::A: Value = Pixel.A; break;
 			default: break;
 			}
-			Pixel = FColor(Value, Value, Value, 255);
-		}
-		if (bSRGB)
-		{
-			for (FColor& Pixel : SourcePixels)
-			{
-				const float LinearValue = static_cast<float>(Pixel.R) / 255.0f;
-				const FColor Encoded = FLinearColor(LinearValue, LinearValue, LinearValue, 1.0f).ToFColorSRGB();
-				Pixel = FColor(Encoded.R, Encoded.G, Encoded.B, 255);
-			}
+			Pixel = FLinearColor(Value, Value, Value, 1.0f);
 		}
 		OutPixels = MoveTemp(SourcePixels);
+		return true;
+	}
+
+	// The only float -> 8-bit conversion on the direct-texture path.
+	bool LoadDirectTexturePixels(const FDirectTextureBinding& Binding, int32 Width, int32 Height,
+		bool bSRGB, TArray<FColor>& OutPixels, float* OutEmissionScale = nullptr)
+	{
+		TArray<FLinearColor> Linear;
+		if (!LoadDirectTextureLinearPixels(Binding, Width, Height, Linear)) return false;
+		float Scale = 1.0f;
+		if (OutEmissionScale)
+		{
+			for (const FLinearColor& Pixel : Linear)
+				Scale = FMath::Max(Scale, FMath::Max3(Pixel.R, Pixel.G, Pixel.B));
+			*OutEmissionScale = Scale;
+		}
+		OutPixels.Reset(Linear.Num());
+		for (const FLinearColor& Pixel : Linear)
+		{
+			const FLinearColor Normalized(Pixel.R / Scale, Pixel.G / Scale, Pixel.B / Scale, Pixel.A);
+			OutPixels.Add(Normalized.ToFColor(bSRGB));
+		}
 		return true;
 	}
 
@@ -495,7 +488,7 @@ namespace
 	bool FindDirectTexture(UMaterialInterface* Material, const EMaterialProperty Property, FDirectTextureBinding& OutBinding)
 	{
 		OutBinding = FDirectTextureBinding();
-		if (!Material)
+		if (!Material || !Material->IsPropertyActive(Property))
 		{
 			return false;
 		}
@@ -765,17 +758,17 @@ namespace
 		MeshSettingsArray.Add(&MeshSettings);
 		FBakeOutput BakeOutput;
 
-		IMaterialBakingModule& MaterialBakingModule = FModuleManager::LoadModuleChecked<IMaterialBakingModule>(TEXT("MaterialBaking"));
-		MaterialBakingModule.SetEmissiveHDR(false);
-		MaterialBakingModule.SetLinearBake(true);
 		if (!MaterialSettings.PropertySizes.IsEmpty())
 		{
+			IMaterialBakingModule& MaterialBakingModule = FModuleManager::LoadModuleChecked<IMaterialBakingModule>(TEXT("MaterialBaking"));
+			const bool bPreviousLinearBake = MaterialBakingModule.IsLinearBake(MP_Metallic);
+			ON_SCOPE_EXIT { MaterialBakingModule.SetLinearBake(bPreviousLinearBake); };
+			MaterialBakingModule.SetLinearBake(true);
+			// Both engine HDR modes provide normalized PropertyData and EmissiveScale.
+			// Leave the shared HDR setting untouched; optional float data is released below.
 			MaterialBakingModule.BakeMaterials(MaterialSettingsArray, MeshSettingsArray, BakeOutput);
 		}
-		// The baking module keeps this as process-wide state.  Restore its
-		// ordinary editor default after the synchronous bake has captured its
-		// per-property color-space metadata.
-		MaterialBakingModule.SetLinearBake(false);
+
 		if (BakeOutput.PropertyData.IsEmpty() && DirectTextures.IsEmpty())
 		{
 			OutError = FString::Printf(TEXT("Material bake returned no property data for slot %d (%s)."), SlotIndex, *Material->GetName());
@@ -910,7 +903,11 @@ namespace
 		if (bNeedEmission)
 		{
 			TArray<FColor> Emission;
-			if (!GetProperty(MP_EmissiveColor, FColor::Black, true, Emission))
+			const FDirectTextureBinding* DirectEmission = DirectTextures.Find(MP_EmissiveColor);
+			const bool bReadEmission = DirectEmission
+				? LoadDirectTexturePixels(*DirectEmission, Options.BakeResolution, Options.BakeResolution, true, Emission, &OutMaterialData.EmissionScale)
+				: GetProperty(MP_EmissiveColor, FColor::Black, true, Emission);
+			if (!bReadEmission)
 			{
 				OutError = FString::Printf(TEXT("Emission material bake failed for slot %d (%s)."), SlotIndex, *Material->GetName());
 				return false;
@@ -938,6 +935,7 @@ namespace
 
 	bool RestorePreviousFiles(const FString& BackupDirectory, const FString& FinalDirectory)
 	{
+		if (PublishFailurePoint == TEXT("publish_restore")) return false;
 		TArray<FString> BackupFiles;
 		IFileManager::Get().FindFilesRecursive(BackupFiles, *BackupDirectory, TEXT("*"), true, false);
 		bool bSuccess = true;
@@ -959,7 +957,9 @@ namespace
 	bool PublishStagedDirectory(
 		const FString& StagingDirectory,
 		const FString& FinalDirectory,
-		FString& OutError)
+		FString& OutError,
+		const FString& ExistingJournalPath = FString(),
+		const FString& JobId = FString())
 	{
 		if (!IFileManager::Get().DirectoryExists(*StagingDirectory))
 		{
@@ -970,6 +970,8 @@ namespace
 		const FString StagingRoot = FPaths::ConvertRelativePathToFull(StagingDirectory);
 		const FString FinalRoot = FPaths::ConvertRelativePathToFull(FinalDirectory);
 		const FString BackupDirectory = StagingRoot + TEXT("_Previous");
+		FString BlockingJournal;
+		if (IsRecoveryBlocked(FinalRoot, BlockingJournal)) { OutError = TEXT("Output requires inspected recovery acknowledgement: ") + BlockingJournal; return false; }
 		const bool bHadFinalDirectory = IFileManager::Get().DirectoryExists(*FinalRoot);
 		if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
 			!IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true))
@@ -1012,6 +1014,25 @@ namespace
 		{
 			IFileManager::Get().FindFilesRecursive(ExistingFiles, *FinalRoot, TEXT("*"), true, false);
 		}
+		TArray<FString> StagedFiles;
+		IFileManager::Get().FindFilesRecursive(StagedFiles, *StagingRoot, TEXT("*"), true, false);
+		if (StagedFiles.IsEmpty()) { OutError = TEXT("Staging is empty; previous output was preserved."); return false; }
+		const FString JournalPath = ExistingJournalPath.IsEmpty() ? FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("FBX_Exporter/Recovery") / (FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".json"))) : ExistingJournalPath;
+		TSharedRef<FJsonObject> Journal = MakeShared<FJsonObject>();
+		Journal->SetNumberField(TEXT("version"), 1);
+		Journal->SetStringField(TEXT("provider_id"), TEXT("fbx_exporter"));
+		if (!JobId.IsEmpty()) Journal->SetStringField(TEXT("job_id"), JobId);
+		Journal->SetStringField(TEXT("state"), TEXT("publishing"));
+		Journal->SetStringField(TEXT("original"), FinalRoot);
+		Journal->SetStringField(TEXT("staging"), StagingRoot);
+		Journal->SetStringField(TEXT("backup"), BackupDirectory);
+		TArray<TSharedPtr<FJsonValue>> Originals, Generated;
+		for (const FString& File : ExistingFiles) Originals.Add(MakeShared<FJsonValueString>(File));
+		for (const FString& File : StagedFiles) Generated.Add(MakeShared<FJsonValueString>(File));
+		Journal->SetArrayField(TEXT("original_files"), Originals);
+		Journal->SetArrayField(TEXT("staged_files"), Generated);
+		if (!WriteJournal(JournalPath, Journal)) { OutError = TEXT("Cannot persist publish journal; existing output was preserved."); return false; }
+		auto MarkRestored = [&]() { Journal->SetStringField(TEXT("state"), TEXT("restored")); WriteJournal(JournalPath, Journal); };
 		for (const FString& ExistingFile : ExistingFiles)
 		{
 			const FString RelativePath = RelativeTo(ExistingFile, FinalRoot);
@@ -1029,7 +1050,7 @@ namespace
 				if (bRestored && (!IFileManager::Get().DirectoryExists(*BackupDirectory) ||
 					IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true)))
 				{
-					// The output was restored and the temporary backup was removed.
+					MarkRestored();
 				}
 				else
 				{
@@ -1037,10 +1058,28 @@ namespace
 				}
 				return false;
 			}
+#if WITH_DEV_AUTOMATION_TESTS
+			if (PublishFailurePoint == TEXT("process_crash_after_backup"))
+			{
+				FString Project = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()); FPaths::NormalizeFilename(Project);
+				const bool bOwnedFixture = Project.Contains(TEXT("/Saved/UnrealTools/V12/Projects/"), ESearchCase::IgnoreCase) || Project.Contains(TEXT("/Saved/UnrealTools/V11/Projects/"), ESearchCase::IgnoreCase);
+				const bool bExplicitFlags = FParse::Param(FCommandLine::Get(), TEXT("FBXExporterCrashCheckpoint")) && FParse::Param(FCommandLine::Get(), TEXT("UnrealToolsOwnedCrashFixture"));
+				if (bOwnedFixture && bExplicitFlags)
+				{
+					const FString Marker = FPaths::ProjectSavedDir() / TEXT("UnrealTools/V12/CrashCheckpoint/ready.json");
+					const auto Ready = ReadJournal(Marker);
+					if (!Ready.IsValid()) { OutError = TEXT("Owned crash fixture marker was not prepared; process exit was refused."); return false; }
+					Ready->SetStringField(TEXT("checkpoint"), TEXT("after_first_backup_move")); Ready->SetStringField(TEXT("journal"), JournalPath);
+					Ready->SetStringField(TEXT("moved_original"), ExistingFile); Ready->SetStringField(TEXT("moved_backup"), BackupPath);
+					if (!WriteJournal(Marker, Ready.ToSharedRef())) { OutError = TEXT("Crash checkpoint marker could not be persisted; process exit was refused."); return false; }
+					// Deliberately bypasses normal module shutdown only in an explicitly
+					// opted-in Automation fixture. Never active in a regular Editor.
+					FPlatformMisc::RequestExitWithStatus(true, 86, TEXT("FBXExporterOwnedCrashAutomation"));
+				}
+			}
+#endif
 		}
 
-		TArray<FString> StagedFiles;
-		IFileManager::Get().FindFilesRecursive(StagedFiles, *StagingRoot, TEXT("*"), true, false);
 		TArray<FString> PublishedFiles;
 		auto CleanupUnexpectedDirectories = [&]()
 		{
@@ -1108,6 +1147,7 @@ namespace
 				OutError += FString::Printf(TEXT(" Previous output was restored, but backup cleanup failed. Preserve staging at '%s' and backup at '%s'."), *StagingRoot, *BackupDirectory);
 				return false;
 			}
+			MarkRestored();
 			return true;
 		};
 
@@ -1122,7 +1162,7 @@ namespace
 			}
 			const FString DestinationPath = FinalRoot / RelativePath;
 			PublishedFiles.Add(DestinationPath);
-			if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationPath), true) ||
+			if (PublishFailurePoint == TEXT("publish_restore") || !IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationPath), true) ||
 				IFileManager::Get().Copy(*DestinationPath, *StagedFile, true, true) != COPY_OK)
 			{
 				OutError = FString::Printf(TEXT("Failed to publish generated file: %s"), *DestinationPath);
@@ -1169,16 +1209,38 @@ namespace
 			}
 		}
 
-		// Anything not present in the staging tree is intentionally removed when
-		// the backup is discarded. This makes the mesh folder plugin-owned while
-		// retaining a complete backup until all publish steps have succeeded.
-		if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
-			!IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true))
+		// Validate every new file before commit while a complete old backup exists.
+		for (const FString& StagedFile : StagedFiles)
 		{
-			OutError = FString::Printf(TEXT("Failed to remove the previous output backup: %s"), *BackupDirectory);
-			RestoreAndCleanupBackup();
-			return false;
+			TArray<uint8> Expected, Actual;
+			const FString Destination = FinalRoot / RelativeTo(StagedFile, StagingRoot);
+			if (!FFileHelper::LoadFileToArray(Expected, *StagedFile) || !FFileHelper::LoadFileToArray(Actual, *Destination) || Expected != Actual)
+			{
+				OutError = FString::Printf(TEXT("Published file verification failed: %s"), *Destination);
+				RestoreAndCleanupBackup(); return false;
+			}
 		}
+		Journal->SetStringField(TEXT("state"), TEXT("committed"));
+		if (!WriteJournal(JournalPath, Journal))
+		{
+			OutError = TEXT("Cannot persist publish commit; restoring the complete previous backup.");
+			RestoreAndCleanupBackup(); return false;
+		}
+		// Commit is durable now. Cleanup may delete only part of the backup, so
+		// it must NEVER trigger rollback or discard the newly verified output.
+		if (PublishFailurePoint == TEXT("cleanup_partial"))
+		{
+			TArray<FString> Previous; IFileManager::Get().FindFilesRecursive(Previous, *BackupDirectory, TEXT("*"), true, false);
+			if (!Previous.IsEmpty()) IFileManager::Get().Delete(*Previous[0], false, true, true);
+		}
+		if (IFileManager::Get().DirectoryExists(*BackupDirectory) &&
+			(PublishFailurePoint == TEXT("cleanup") || PublishFailurePoint == TEXT("cleanup_partial") || !IFileManager::Get().DeleteDirectory(*BackupDirectory, false, true)))
+		{
+			OutError = FString::Printf(TEXT("Export committed successfully; previous backup cleanup failed. Preserve backup '%s' and journal '%s'."), *BackupDirectory, *JournalPath);
+			Journal->SetStringField(TEXT("cleanup_warning"), OutError); WriteJournal(JournalPath, Journal);
+			return true;
+		}
+		Journal->SetStringField(TEXT("state"), TEXT("complete")); WriteJournal(JournalPath, Journal);
 		return true;
 	}
 
@@ -1308,287 +1370,537 @@ namespace
 		}
 	}
 
-	FFBXExporterResult ExportStaticMesh(UStaticMesh* StaticMesh, const FFBXExporterOptions& Options)
+	class FExportRunner final : public UnrealToolsRuntime::IItemRunner
 	{
-		FFBXExporterResult Result;
-		if (!StaticMesh)
+	public:
+		FExportRunner(const UnrealToolsRuntime::FItemSpec& InSpec, const FString& InJobId)
+			: Spec(InSpec), Options(OptionsFromJson(InSpec.Options)), JobId(InJobId) {}
+		virtual ~FExportRunner() override { ReleaseReferences(); }
+		virtual FString GetStage() const override
 		{
-			Result.Errors.Add(TEXT("No Static Mesh was selected."));
-			return Result;
+			return Stage == TEXT("materials") || Stage == TEXT("png") ? FString::Printf(TEXT("%s.slot_%d.group_%d"), *Stage, SlotIndex, GroupIndex) : Stage;
 		}
-		if (!StaticMesh->HasValidRenderData() || StaticMesh->GetNumLODs() <= 0)
+		virtual bool CanCancel() const override { return !IsCommitPhase() && (!PngTask.IsValid() || PngTask.IsReady()); }
+		virtual bool IsCommitPhase() const override { return Stage == TEXT("publish") || Stage == TEXT("cleanup"); }
+		virtual uint64 GetSnapshotRevision() const override { return SnapshotRevision; }
+		virtual UnrealToolsRuntime::FObject GetResult() const override
 		{
-			Result.Errors.Add(FString::Printf(TEXT("Static Mesh has no valid LOD0 render data: %s"), *StaticMesh->GetPathName()));
-			return Result;
-		}
-		if (Options.OutputRoot.IsEmpty())
-		{
-			Result.Errors.Add(TEXT("Output folder is empty."));
-			return Result;
-		}
-		if (Options.TextureMaps != EFBXExporterTextureMap::None &&
-			(Options.BakeResolution <= 0 || Options.BakeResolution > 16384))
-		{
-			Result.Errors.Add(TEXT("Bake resolution must be between 1 and 16384 pixels."));
-			return Result;
-		}
-		const uint8 KnownTextureMapBits = static_cast<uint8>(EFBXExporterTextureMap::All);
-		if ((static_cast<uint8>(Options.TextureMaps) & static_cast<uint8>(~KnownTextureMapBits)) != 0)
-		{
-			Result.Errors.Add(TEXT("TextureMaps contains unsupported map bits."));
-			return Result;
-		}
-
-		const FString MeshName = MakeSafeFileName(StaticMesh->GetName());
-		const FString FinalDirectory = FPaths::Combine(Options.OutputRoot, MeshName);
-		if (IFileManager::Get().DirectoryExists(*FinalDirectory))
-		{
-			const EAppReturnType::Type OverwriteChoice = FMessageDialog::Open(
-				EAppMsgType::YesNo,
-				FText::Format(
-					LOCTEXT("OverwriteExistingMeshFolder", "The entire export folder for {0}, including user files, will be replaced. Continue?"),
-					FText::FromString(StaticMesh->GetName())));
-			if (OverwriteChoice != EAppReturnType::Yes)
-			{
-				return Result;
-			}
-		}
-		if (!IFileManager::Get().MakeDirectory(*Options.OutputRoot, true))
-		{
-			Result.Errors.Add(FString::Printf(TEXT("Failed to create output root: %s"), *Options.OutputRoot));
-			return Result;
+			using namespace UnrealToolsRuntime;
+			if (CachedResult.IsValid() && CachedRevision == SnapshotRevision) return Clone(CachedResult);
+			FObject Data = OptionsToJson(Options);
+			Data->SetStringField(TEXT("mesh_path"), Spec.MeshPath);
+			Data->SetBoolField(TEXT("success"), Result.Succeeded());
+			Data->SetStringField(TEXT("stage"), GetStage());
+			Data->SetStringField(TEXT("final_directory"), FinalDirectory);
+			if (!StagingDirectory.IsEmpty()) Data->SetStringField(TEXT("staging_directory"), StagingDirectory);
+			Data->SetStringField(TEXT("fbx_file"), FinalFbxPath);
+			Data->SetStringField(TEXT("error_code"), ErrorCode);
+			if (Options.TextureMaps == EFBXExporterTextureMap::None) Data->SetField(TEXT("metadata_file"), MakeShared<FJsonValueNull>());
+			else Data->SetStringField(TEXT("metadata_file"), FinalDirectory / (MeshName + TEXT("_Materials.json")));
+			auto Values = [](const TArray<FString>& Array) { TArray<TSharedPtr<FJsonValue>> Out; for (const FString& Item : Array) Out.Add(MakeShared<FJsonValueString>(Item)); return Out; };
+			Data->SetArrayField(TEXT("warnings"), Values(Result.Warnings));
+			Data->SetArrayField(TEXT("errors"), Values(Result.Errors));
+			if (!Result.Succeeded()) Data->SetStringField(TEXT("error"), Result.Errors.IsEmpty() ? TEXT("Export has not finished.") : Result.Errors[0]);
+			Data->SetArrayField(TEXT("files"), Values(PublishedFiles));
+			if (bKeepStaging) Data->SetStringField(TEXT("recovery_staging"), StagingDirectory);
+			if (bRecoveryRequired) { Data->SetStringField(TEXT("recovery_journal"), JournalPath); Data->SetBoolField(TEXT("recovery_required"), true); }
+			else if ((IsCommitPhase() || bKeepStaging) && !JournalPath.IsEmpty()) Data->SetStringField(TEXT("recovery_journal"), JournalPath);
+			if (!RecoveryBackup.IsEmpty()) Data->SetStringField(TEXT("recovery_backup"), RecoveryBackup);
+			CachedRevision = SnapshotRevision; CachedResult = Data;
+			return Clone(CachedResult);
 		}
 
-		const FString StagingDirectory = Options.OutputRoot / (TEXT(".FBX_Exporter_") + FGuid::NewGuid().ToString(EGuidFormats::Digits));
-		if (!IFileManager::Get().MakeDirectory(*StagingDirectory, true))
+		virtual void Shutdown() override { if (PngTask.IsValid()) { PngTask.Wait(); PngTask.Get(); } bKeepStaging = true; PendingPixels.Empty(); ReleaseReferences(); ++SnapshotRevision; }
+		virtual UnrealToolsRuntime::EStepResult Step(bool bCancelRequested, bool bInlineMode) override
 		{
-			Result.Errors.Add(FString::Printf(TEXT("Failed to create staging directory: %s"), *StagingDirectory));
-			return Result;
-		}
-		bool bKeepBackup = false;
-		const auto CleanupStaging = [&StagingDirectory, &bKeepBackup]()
-		{
-			if (bKeepBackup)
+			using namespace UnrealToolsRuntime;
+			check(IsInGameThread());
+			if (Stage == TEXT("done")) return Result.Succeeded() ? EStepResult::Succeeded : EStepResult::Failed;
+			const FString PreviousStage = GetStage();
+			const int32 PreviousWarnings = Result.Warnings.Num(), PreviousErrors = Result.Errors.Num();
+			const bool bPreviousSuccess = Result.bSuccess;
+			ON_SCOPE_EXIT
 			{
-				return;
+				if (PreviousStage != GetStage() || PreviousWarnings != Result.Warnings.Num() || PreviousErrors != Result.Errors.Num() || bPreviousSuccess != Result.bSuccess) ++SnapshotRevision;
+			};
+			if ((bCancelRequested || (GEditor && (GEditor->PlayWorld || GEditor->bIsSimulatingInEditor))) && CanCancel())
+			{
+				Result.Errors.Add(bCancelRequested ? TEXT("Cancelled at a safe export boundary.") : TEXT("PIE/SIE started during export."));
+				ErrorCode = bCancelRequested ? TEXT("cancelled") : TEXT("editor_playing"); Cleanup(); Stage = TEXT("done");
+				return bCancelRequested ? EStepResult::Cancelled : EStepResult::Failed;
 			}
-			IFileManager::Get().DeleteDirectory(*StagingDirectory, false, true);
-			IFileManager::Get().DeleteDirectory(*(StagingDirectory + TEXT("_Previous")), false, true);
+			FString Error;
+			if (Stage == TEXT("validate"))
+			{
+				Mesh.Reset(LoadObject<UStaticMesh>(nullptr, *Spec.MeshPath));
+				const FPreflightResult Check = PreflightStaticMesh(Mesh.Get(), Options);
+				Result.Warnings.Append(Check.Warnings);
+				if (!Check.bCanExport) return Fail(FString::Join(Check.Errors, TEXT("\n")), TEXT("preflight_failed"));
+				if (Check.bRequiresOverwrite && !Spec.bOverwrite) return Fail(TEXT("Output exists; explicitly approve overwrite after preflight."), TEXT("overwrite_required"));
+				MeshName = MakeSafeFileName(Mesh->GetName()); FinalDirectory = Check.FinalDirectory;
+				FinalFbxPath = Check.FbxFile;
+				StagingDirectory = Options.OutputRoot / (TEXT(".FBX_Exporter_") + FGuid::NewGuid().ToString(EGuidFormats::Digits));
+				if (!IFileManager::Get().MakeDirectory(*StagingDirectory, true)) return Fail(TEXT("Cannot create staging directory."), TEXT("staging_failed"));
+				StagedFbxPath = StagingDirectory / (MeshName + TEXT(".fbx"));
+				BuildSlotNames(Mesh.Get(), Slots);
+				WatchPackage(Mesh.Get());
+				for (const FStaticMaterial& Slot : Mesh->GetStaticMaterials())
+				{
+					if (UMaterialInterface* Material = Slot.MaterialInterface)
+					{
+						HeldObjects.Emplace(Material); WatchPackage(Material); WatchPackage(Material->GetMaterial());
+						TArray<UMaterialFunctionInterface*> Functions; Material->GetDependentFunctions(Functions);
+						for (UMaterialFunctionInterface* Function : Functions) { HeldObjects.Emplace(Function); WatchPackage(Function); }
+						for (UMaterialInstance* Instance = Cast<UMaterialInstance>(Material); Instance; Instance = Cast<UMaterialInstance>(Instance->Parent))
+							if (Instance->Parent) { HeldObjects.Emplace(Instance->Parent.Get()); WatchPackage(Instance->Parent); }
+						TArray<UTexture*> Textures; Material->GetUsedTextures(Textures);
+						for (UTexture* Texture : Textures) { HeldObjects.Emplace(Texture); WatchPackage(Texture); }
+					}
+				}
+				ModifiedHandle = FCoreUObjectDelegates::OnObjectModified.AddLambda([this](UObject* Object) { if (Object && WatchedPackages.Contains(Object->GetOutermost())) bSourceChanged = true; });
+				PropertyHandle = FCoreUObjectDelegates::OnObjectPropertyChanged.AddLambda([this](UObject* Object, FPropertyChangedEvent&) { if (Object && WatchedPackages.Contains(Object->GetOutermost())) bSourceChanged = true; });
+				// Each tick handles one dependency group, never all maps/all slots.
+				const EFBXExporterTextureMap Selected = Options.TextureMaps;
+				if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::BaseColor)) Groups.Add(EFBXExporterTextureMap::BaseColor | (Selected & EFBXExporterTextureMap::Opacity));
+				else if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::Opacity)) Groups.Add(EFBXExporterTextureMap::Opacity);
+				if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::Mask)) Groups.Add(EFBXExporterTextureMap::Mask | (Selected & EFBXExporterTextureMap::Occlusion));
+				else if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::Occlusion)) Groups.Add(EFBXExporterTextureMap::Occlusion);
+				if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::Normal)) Groups.Add(EFBXExporterTextureMap::Normal);
+				if (IsFBXExporterTextureMapEnabled(Selected, EFBXExporterTextureMap::Emission)) Groups.Add(EFBXExporterTextureMap::Emission);
+				Stage = TEXT("geometry");
+			}
+			else if (Stage == TEXT("geometry"))
+			{
+				if (!ExportFbx(Mesh.Get(), StagedFbxPath, Error)) return Fail(Error, TEXT("geometry_failed"));
+				Stage = Groups.IsEmpty() ? TEXT("files") : TEXT("materials");
+			}
+			else if (Stage == TEXT("materials"))
+			{
+				if (SlotIndex >= Slots.Num()) { Stage = TEXT("files"); return EStepResult::Continue; }
+				UMaterialInterface* Material = Mesh->GetMaterial(SlotIndex);
+				if (!Material) { Result.Warnings.Add(FString::Printf(TEXT("Material slot %d has no assigned material."), SlotIndex)); ++SlotIndex; GroupIndex = 0; return EStepResult::Continue; }
+				FFBXExporterOptions GroupOptions = Options; GroupOptions.TextureMaps = Groups[GroupIndex];
+				FBakedMaterialData Data;
+				if (!BakeMaterial(Mesh.Get(), SlotIndex, Material, GroupOptions, Data, Error)) return Fail(Error, TEXT("bake_failed"));
+				if (IsFBXExporterTextureMapEnabled(GroupOptions.TextureMaps, EFBXExporterTextureMap::Emission)) Slots[SlotIndex].EmissionScale = Data.EmissionScale;
+				Result.Warnings.Append(Data.Warnings);
+				PendingPixels = MoveTemp(Data.MapPixels); PendingPixels.GetKeys(PendingMapNames); PendingMapNames.Sort(); PendingMapIndex = 0;
+				Stage = TEXT("png");
+			}
+			else if (Stage == TEXT("png"))
+			{
+				if (PendingMapIndex >= PendingMapNames.Num())
+				{
+					PendingPixels.Empty(); PendingMapNames.Empty(); ++GroupIndex;
+					if (GroupIndex >= Groups.Num()) { GroupIndex = 0; ++SlotIndex; }
+					Stage = TEXT("materials"); return EStepResult::Continue;
+				}
+				const FString MapName = PendingMapNames[PendingMapIndex];
+				const bool bSRGB = MapName == TEXT("BaseColor") || MapName == TEXT("Emission");
+				const FString RelativePath = TEXT("Textures/") + GetMapFileName(Slots[SlotIndex].SlotName, MapName);
+				const FString Path = StagingDirectory / RelativePath;
+				FPngWrite Write;
+				if (!PngTask.IsValid())
+				{
+					TArray<FColor> Pixels = MoveTemp(PendingPixels.FindChecked(MapName)); PendingPixels.Remove(MapName);
+					const int32 Resolution = Options.BakeResolution;
+					// Load codecs on the game thread; worker owns only plain pixels/paths.
+					FModuleManager::LoadModuleChecked<IModuleInterface>(TEXT("ImageWrapper"));
+					auto Work = [Pixels = MoveTemp(Pixels), Path, Resolution, bSRGB]() mutable
+					{
+						FPngWrite Outcome;
+						Outcome.bSuccess = IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true) && SaveImage(Path, Pixels, Resolution, Resolution, bSRGB, Outcome.Error);
+						if (!Outcome.bSuccess && Outcome.Error.IsEmpty()) Outcome.Error = TEXT("Cannot create PNG directory: ") + Path;
+						Pixels.Empty(); return Outcome;
+					};
+					if (bInlineMode) Write = Work();
+					else { PngTask = Async(EAsyncExecution::ThreadPool, MoveTemp(Work)); return EStepResult::Continue; }
+				}
+				else
+				{
+					if (!PngTask.IsReady()) return EStepResult::Continue;
+					Write = PngTask.Get(); PngTask = TFuture<FPngWrite>();
+				}
+				if (!Write.bSuccess) return Fail(Write.Error, TEXT("png_failed"));
+				FFBXExporterTextureFileData TextureFile;
+				TextureFile.MapName = MapName; TextureFile.RelativePath = RelativePath; TextureFile.StagedAbsolutePath = Path;
+				TextureFile.FinalAbsolutePath = FinalDirectory / RelativePath; TextureFile.ColorSpace = bSRGB ? TEXT("sRGB") : TEXT("Linear");
+				if (Options.bEmbedTexturesInFbx && !FFileHelper::LoadFileToArray(TextureFile.FileBytes, *Path)) return Fail(TEXT("Cannot read generated PNG for embedding."), TEXT("png_failed"));
+				Slots[SlotIndex].MapRelativePaths.Add(MapName, RelativePath); TextureFiles.Add(MoveTemp(TextureFile)); ++PendingMapIndex;
+			}
+
+			else if (Stage == TEXT("files"))
+			{
+				if (bSourceChanged) return Fail(TEXT("Source mesh/material/texture was modified during this export."), TEXT("source_changed"));
+				TArray<FFBXExporterSectionData> Sections;
+				for (const FStaticMeshSection& Section : Mesh->GetRenderData()->LODResources[0].Sections)
+				{
+					FFBXExporterSectionData Data; Data.SlotIndex = Section.MaterialIndex; Data.TriangleCount = Section.NumTriangles;
+					Data.bHasMaterial = Slots.IsValidIndex(Section.MaterialIndex) && Slots[Section.MaterialIndex].bHasMaterial; Sections.Add(Data);
+				}
+				TArray<FFBXExporterMaterialBinding> Bindings;
+				if (!PostProcessFbx(StagedFbxPath, FinalFbxPath, Sections, Slots, TextureFiles, Options.bEmbedTexturesInFbx && !Groups.IsEmpty(), Bindings, Error)) return Fail(Error, TEXT("fbx_media_failed"));
+				TextureFiles.Empty();
+				if (!Groups.IsEmpty() && !SaveMetadataJson(StagingDirectory / (MeshName + TEXT("_Materials.json")), Spec.MeshPath, FinalFbxPath, Options, Slots, Bindings, Error)) return Fail(Error, TEXT("metadata_failed"));
+				Stage = TEXT("verify");
+			}
+			else if (Stage == TEXT("verify"))
+			{
+				if (bSourceChanged) return Fail(TEXT("Source changed before publish."), TEXT("source_changed"));
+				const FPreflightResult Check = PreflightStaticMesh(Mesh.Get(), Options);
+				if (!Check.bCanExport) return Fail(FString::Join(Check.Errors, TEXT("\n")), TEXT("preflight_failed"));
+				if (Check.bRequiresOverwrite && !Spec.bOverwrite) return Fail(TEXT("Output appeared during export; previous output was preserved."), TEXT("overwrite_required"));
+				if (IFileManager::Get().FileSize(*StagedFbxPath) <= 0) return Fail(TEXT("FBX staging validation failed."), TEXT("verification_failed"));
+				JournalPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("FBX_Exporter/Recovery") / (FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".json")));
+				Stage = TEXT("publish");
+			}
+			else if (Stage == TEXT("publish"))
+			{
+				if (bSourceChanged) return Fail(TEXT("Source changed before publish."), TEXT("source_changed"));
+				if (!PublishStagedDirectory(StagingDirectory, FinalDirectory, Error, JournalPath, JobId)) { bKeepStaging = true; FString BlockingJournal; bRecoveryRequired = IsRecoveryBlocked(FinalDirectory, BlockingJournal); RecoveryBackup = IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous"))) ? StagingDirectory + TEXT("_Previous") : FString(); return Fail(Error, TEXT("publish_failed")); }
+				if (!Error.IsEmpty()) { Result.Warnings.Add(Error); bKeepStaging = true; }
+				IFileManager::Get().FindFilesRecursive(PublishedFiles, *FinalDirectory, TEXT("*"), true, false); PublishedFiles.Sort();
+				RecoveryBackup = IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous"))) ? StagingDirectory + TEXT("_Previous") : FString();
+				Result.bSuccess = true; Result.FinalDirectory = FinalDirectory; Stage = TEXT("cleanup");
+			}
+			else if (Stage == TEXT("cleanup")) { Cleanup(); Stage = TEXT("done"); return EStepResult::Succeeded; }
+			return EStepResult::Continue;
+		}
+	private:
+		struct FPngWrite { bool bSuccess = false; FString Error; };
+		TFuture<FPngWrite> PngTask; TMap<FString, TArray<FColor>> PendingPixels; TArray<FString> PendingMapNames; int32 PendingMapIndex = 0;
+		UnrealToolsRuntime::EStepResult Fail(const FString& Error, const FString& Code)
+		{ Result.Errors.Add(Error); ErrorCode = Code; Cleanup(); Stage = TEXT("done"); return UnrealToolsRuntime::EStepResult::Failed; }
+		void WatchPackage(UObject* Object) { if (Object) WatchedPackages.Add(Object->GetOutermost()); }
+		void ReleaseReferences()
+		{
+			if (ModifiedHandle.IsValid()) { FCoreUObjectDelegates::OnObjectModified.Remove(ModifiedHandle); ModifiedHandle.Reset(); }
+			if (PropertyHandle.IsValid()) { FCoreUObjectDelegates::OnObjectPropertyChanged.Remove(PropertyHandle); PropertyHandle.Reset(); }
+			HeldObjects.Empty(); Mesh.Reset();
+		}
+		void Cleanup()
+		{
+			if (!bKeepStaging && !StagingDirectory.IsEmpty() && IFileManager::Get().DirectoryExists(*StagingDirectory) && !IFileManager::Get().DeleteDirectory(*StagingDirectory, false, true))
+			{ Result.Warnings.Add(TEXT("Staging cleanup failed: ") + StagingDirectory); bKeepStaging = true; }
+			PendingPixels.Empty(); PendingMapNames.Empty(); ReleaseReferences();
+		}
+		UnrealToolsRuntime::FItemSpec Spec; FFBXExporterOptions Options; FString JobId;
+		TStrongObjectPtr<UStaticMesh> Mesh; TArray<TStrongObjectPtr<UObject>> HeldObjects; TSet<UPackage*> WatchedPackages; FDelegateHandle ModifiedHandle, PropertyHandle;
+		FFBXExporterResult Result; FString Stage = TEXT("validate"), ErrorCode, MeshName, StagingDirectory, StagedFbxPath, FinalFbxPath, FinalDirectory, JournalPath;
+		bool bSourceChanged = false, bKeepStaging = false, bRecoveryRequired = false;
+		uint64 SnapshotRevision = 1; mutable uint64 CachedRevision = 0; mutable UnrealToolsRuntime::FObject CachedResult;
+		TArray<FString> PublishedFiles; FString RecoveryBackup;
+		int32 SlotIndex = 0, GroupIndex = 0;
+		TArray<EFBXExporterTextureMap> Groups; TArray<FFBXExporterSlotData> Slots; TArray<FFBXExporterTextureFileData> TextureFiles;
+	};
+
+
+}
+
+bool IsExportInProgress()
+{
+	return Jobs().IsBusy();
+}
+
+TUniquePtr<UnrealToolsRuntime::IItemRunner> CreateExportRunner(const UnrealToolsRuntime::FItemSpec& Spec, const FString& JobId)
+{ return MakeUnique<FExportRunner>(Spec, JobId); }
+
+bool IsRecoveryBlocked(const FString& FinalDirectory, FString& OutJournal)
+{
+	TArray<FString> Files;
+	IFileManager::Get().FindFilesRecursive(Files, *(FPaths::ProjectSavedDir() / TEXT("FBX_Exporter/Recovery")), TEXT("*.json"), true, false);
+	FString Wanted = FPaths::ConvertRelativePathToFull(FinalDirectory); FPaths::NormalizeDirectoryName(Wanted);
+	for (const FString& File : Files)
+	{
+		const TSharedPtr<FJsonObject> Data = ReadJournal(File);
+		FString Original, State;
+		FString ValidationError;
+		if (!ValidateRecoveryJournal(Data, ValidationError))
+		{
+			OutJournal = File; return true;
+		}
+		Data->TryGetStringField(TEXT("original"), Original); Data->TryGetStringField(TEXT("state"), State);
+		FPaths::NormalizeDirectoryName(Original);
+		if (UnrealToolsRuntime::PathsOverlap(Original, Wanted) && State == TEXT("publishing")) { OutJournal = File; return true; }
+	}
+	return false;
+}
+
+bool AcknowledgeRecovery(const FString& JournalPath, FString& OutError)
+{
+	const FString Path = FPaths::ConvertRelativePathToFull(JournalPath);
+	const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("FBX_Exporter/Recovery"));
+	if (!FPaths::IsUnderDirectory(Path, Root)) { OutError = TEXT("Recovery journal must belong to this project's FBX Exporter."); return false; }
+	const TSharedPtr<FJsonObject> Data = ReadJournal(Path);
+	if (!ValidateRecoveryJournal(Data, OutError)) return false;
+	if (UnrealToolsRuntime::GetString(Data, TEXT("state")) == TEXT("acknowledged")) return true;
+	Data->SetStringField(TEXT("state"), TEXT("acknowledged"));
+	Data->SetBoolField(TEXT("files_unchanged"), true);
+	if (!WriteJournal(Path, Data.ToSharedRef())) { OutError = TEXT("Could not persist recovery acknowledgement."); return false; }
+	return true;
+}
+
+bool ValidateRecoveryJournal(const UnrealToolsRuntime::FObject& Data, FString& OutError)
+{
+	using namespace UnrealToolsRuntime;
+	if (!Data.IsValid() || !Data->HasTypedField<EJson::Number>(TEXT("version")) || GetNumber(Data, TEXT("version")) != 1)
+	{ OutError = TEXT("Unreadable or unsupported FBX recovery journal version."); return false; }
+	const FString State = GetString(Data, TEXT("state"));
+	if ((Data->HasField(TEXT("provider_id")) && GetString(Data, TEXT("provider_id")) != TEXT("fbx_exporter")) ||
+		(Data->HasField(TEXT("job_id")) && (!Data->HasTypedField<EJson::String>(TEXT("job_id")) || GetString(Data, TEXT("job_id")).IsEmpty())))
+	{ OutError = TEXT("Foreign or invalid FBX recovery journal owner."); return false; }
+	if (!TSet<FString>{TEXT("publishing"), TEXT("committed"), TEXT("complete"), TEXT("restored"), TEXT("acknowledged")}.Contains(State))
+	{ OutError = TEXT("Unsupported FBX recovery journal state."); return false; }
+	FString Original, Staging, Backup;
+	if (!Data->TryGetStringField(TEXT("original"), Original) || !Data->TryGetStringField(TEXT("staging"), Staging) || !Data->TryGetStringField(TEXT("backup"), Backup) ||
+		Original.IsEmpty() || Staging.IsEmpty() || Backup.IsEmpty() || FPaths::IsRelative(Original) || FPaths::IsRelative(Staging) || FPaths::IsRelative(Backup) ||
+		CanonicalPath(Backup) != CanonicalPath(Staging + TEXT("_Previous")) || PathsOverlap(Original, Staging) || PathsOverlap(Original, Backup))
+	{ OutError = TEXT("Invalid FBX recovery original/staging/backup paths."); return false; }
+	for (const auto& Pair : {TPair<const TCHAR*, FString>(TEXT("original_files"), Original), TPair<const TCHAR*, FString>(TEXT("staged_files"), Staging)})
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Files;
+		if (!Data->TryGetArrayField(Pair.Key, Files)) { OutError = TEXT("FBX recovery file list must be an array."); return false; }
+		for (const auto& Value : *Files)
+		{
+			FString File;
+			if (!Value.IsValid() || Value->Type != EJson::String || !Value->TryGetString(File) || FPaths::IsRelative(File) || !FPaths::IsUnderDirectory(File, Pair.Value))
+			{ OutError = TEXT("FBX recovery file list contains an invalid or foreign path."); return false; }
+		}
+	}
+	return true;
+}
+
+void AnnotateRecoveryStatus(const UnrealToolsRuntime::FObject& Job)
+{
+	using namespace UnrealToolsRuntime;
+	for (const auto& Item : GetArray(Job, TEXT("items")))
+	{
+		const auto Result = GetObject(Item->AsObject(), TEXT("result"));
+		const FString Journal = GetString(Result, TEXT("recovery_journal"));
+		if (Journal.IsEmpty()) continue;
+		const bool bMissing = !IFileManager::Get().FileExists(*Journal);
+		Result->SetBoolField(TEXT("recovery_journal_missing"), bMissing);
+		if (bMissing && GetBool(Job, TEXT("recovery_required")))
+		{
+			const FString Warning = TEXT("Recorded recovery journal is missing; publishing may not have started. Inspect output, staging and backup before explicit acknowledgement: ") + Journal;
+			auto Warnings = GetArray(Result, TEXT("warnings"));
+			if (!Warnings.ContainsByPredicate([&Warning](const auto& Value) { return Value->AsString() == Warning; })) Warnings.Add(MakeShared<FJsonValueString>(Warning));
+			Result->SetArrayField(TEXT("warnings"), Warnings);
+		}
+	}
+}
+
+namespace
+{
+	struct FRecoveryScan
+	{
+		explicit FRecoveryScan(const FString& InRoot) : Root(FPaths::ConvertRelativePathToFull(InRoot)) {}
+		FString Root;
+		TSet<FString> Recorded; TArray<UnrealToolsRuntime::FObject> Page; TArray<FString> Files;
+		int32 Offset = 0, PageIndex = 0, FileIndex = 0; bool bArchive = false, bJobsDone = false, bFilesListed = false;
+	};
+	TUniquePtr<FRecoveryScan> RecoveryScan;
+	bool HasCurrentRecoveryReference(UnrealToolsRuntime::FJobService& Service, const UnrealToolsRuntime::FObject& Data, const FString& File)
+	{
+		using namespace UnrealToolsRuntime;
+		const FString Source = CanonicalPath(FPaths::ConvertRelativePathToFull(File));
+		auto References = [&Source](const FObject& Job)
+		{
+			const FString State = GetString(Job, TEXT("state"));
+			if (State != TEXT("queued") && State != TEXT("running") && !GetBool(Job, TEXT("recovery_required"))) return false;
+			for (const auto& Item : GetArray(Job, TEXT("items")))
+			{
+				const FString Journal = GetString(GetObject(Item->AsObject(), TEXT("result")), TEXT("recovery_journal"));
+				if (!Journal.IsEmpty() && CanonicalPath(FPaths::ConvertRelativePathToFull(Journal)) == Source) return true;
+			}
+			return false;
 		};
-
-		TArray<FFBXExporterSlotData> Slots;
-		BuildSlotNames(StaticMesh, Slots);
-		const FString StagedFbxPath = StagingDirectory / (MeshName + TEXT(".fbx"));
-		const FString FinalFbxPath = FinalDirectory / (MeshName + TEXT(".fbx"));
-		FString Error;
-		if (!ExportFbx(StaticMesh, StagedFbxPath, Error))
+		const FString Owner = GetString(Data, TEXT("job_id"));
+		if (!Owner.IsEmpty())
 		{
-			Result.Errors.Add(Error);
-			CleanupStaging();
-			return Result;
+			auto Selector = MakeShared<FJsonObject>(); Selector->SetStringField(TEXT("job_id"), Owner);
+			return References(Service.Status(Selector));
 		}
-
-		TArray<FFBXExporterTextureFileData> TextureFiles;
-		if (Options.TextureMaps != EFBXExporterTextureMap::None)
-		{
-			for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex)
+		// Older domain journals can omit job_id. Consult current active and
+		// protected recovery references, never infer ownership from output paths.
+		for (const auto& Job : Service.GetActiveJobs()) if (References(Job)) return true;
+		for (bool Archived : {false, true})
+			for (int32 Offset = 0; ; Offset += 50)
 			{
-				UMaterialInterface* Material = StaticMesh->GetMaterial(SlotIndex);
-				if (!Material)
-				{
-					Result.Warnings.Add(FString::Printf(TEXT("Material slot %d has no assigned material; no textures were generated."), SlotIndex));
-					continue;
-				}
-				FBakedMaterialData MaterialData;
-				if (!BakeMaterial(StaticMesh, SlotIndex, Material, Options, MaterialData, Error))
-				{
-					Result.Errors.Add(Error);
-					CleanupStaging();
-					return Result;
-				}
-				Slots[SlotIndex].EmissionScale = MaterialData.EmissionScale;
-				TArray<FString> SortedMapNames;
-				MaterialData.MapPixels.GetKeys(SortedMapNames);
-				SortedMapNames.Sort();
-				for (const FString& MapName : SortedMapNames)
-				{
-					const TArray<FColor>* MapPixels = MaterialData.MapPixels.Find(MapName);
-					if (!MapPixels)
-					{
-						Result.Errors.Add(FString::Printf(TEXT("Missing generated pixel data for map %s."), *MapName));
-						CleanupStaging();
-						return Result;
-					}
-					const bool bSRGB = MapName == TEXT("BaseColor") || MapName == TEXT("Emission");
-					FString RelativePath = FPaths::Combine(TEXT("Textures"), GetMapFileName(Slots[SlotIndex].SlotName, MapName));
-					RelativePath.ReplaceInline(TEXT("\\"), TEXT("/"));
-					const FString AbsolutePath = StagingDirectory / RelativePath;
-					if (!IFileManager::Get().MakeDirectory(*FPaths::GetPath(AbsolutePath), true) ||
-						!SaveImage(AbsolutePath, *MapPixels, Options.BakeResolution, Options.BakeResolution, bSRGB, Error))
-					{
-						Result.Errors.Add(Error);
-						CleanupStaging();
-						return Result;
-					}
-					FFBXExporterTextureFileData TextureFile;
-					TextureFile.MapName = MapName;
-					TextureFile.RelativePath = RelativePath;
-					TextureFile.StagedAbsolutePath = AbsolutePath;
-					TextureFile.FinalAbsolutePath = FinalDirectory / RelativePath;
-					TextureFile.ColorSpace = bSRGB ? TEXT("sRGB") : TEXT("Linear");
-					if (!FFileHelper::LoadFileToArray(TextureFile.FileBytes, *AbsolutePath))
-					{
-						Result.Errors.Add(FString::Printf(TEXT("Failed to read generated texture: %s"), *AbsolutePath));
-						CleanupStaging();
-						return Result;
-					}
-					Slots[SlotIndex].MapRelativePaths.Add(MapName, RelativePath);
-					TextureFiles.Add(MoveTemp(TextureFile));
-				}
-				Result.Warnings.Append(MaterialData.Warnings);
+				const auto Page = Service.GetJobSummaries(Offset, 50, Archived);
+				if (Page.IsEmpty()) break;
+				for (const auto& Summary : Page)
+					if (GetBool(Summary, TEXT("recovery_required")))
+						for (const auto& Journal : GetArray(Summary, TEXT("recovery_journals")))
+							if (CanonicalPath(FPaths::ConvertRelativePathToFull(Journal->AsString())) == Source) return true;
 			}
-		}
-
-		TArray<FFBXExporterSectionData> Sections;
-		const FStaticMeshLODResources& LOD0 = StaticMesh->GetRenderData()->LODResources[0];
-		for (const FStaticMeshSection& Section : LOD0.Sections)
+		return false;
+	}
+	bool AdvanceRecoveryScan(FRecoveryScan& Scan, UnrealToolsRuntime::FJobService& Service, int32 Budget)
+{
+	using namespace UnrealToolsRuntime;
+	for (int32 Work = 0; Work < Budget; ++Work)
+	{
+		if (!Scan.bJobsDone)
 		{
-			FFBXExporterSectionData SectionData;
-			SectionData.SlotIndex = Section.MaterialIndex;
-			SectionData.TriangleCount = Section.NumTriangles;
-			SectionData.bHasMaterial = Slots.IsValidIndex(Section.MaterialIndex) && Slots[Section.MaterialIndex].bHasMaterial;
-			Sections.Add(SectionData);
-		}
-		TArray<FFBXExporterMaterialBinding> Bindings;
-		if (!FBXExporter::PostProcessFbx(StagedFbxPath, FinalFbxPath, Sections, Slots, TextureFiles,
-			Options.bEmbedTexturesInFbx && Options.TextureMaps != EFBXExporterTextureMap::None, Bindings, Error))
-		{
-			Result.Errors.Add(Error);
-			CleanupStaging();
-			return Result;
-		}
-		if (Options.TextureMaps != EFBXExporterTextureMap::None)
-		{
-			const FString JsonPath = StagingDirectory / (MeshName + TEXT("_Materials.json"));
-			if (!SaveMetadataJson(JsonPath, StaticMesh->GetPathName(), FinalFbxPath, Options, Slots, Bindings, Error))
+			if (Scan.PageIndex >= Scan.Page.Num())
 			{
-				Result.Errors.Add(Error);
-				CleanupStaging();
-				return Result;
+				Scan.Page = Service.GetJobSummaries(Scan.Offset, 50, Scan.bArchive); Scan.PageIndex = 0;
+				if (Scan.Page.IsEmpty()) { if (!Scan.bArchive) { Scan.bArchive = true; Scan.Offset = 0; continue; } Scan.bJobsDone = true; continue; }
+				Scan.Offset += Scan.Page.Num();
 			}
+			const auto Summary = Scan.Page[Scan.PageIndex++];
+			const FString State = GetString(Summary, TEXT("state"));
+			if (!GetBool(Summary, TEXT("recovery_required")) && State != TEXT("queued") && State != TEXT("running")) continue;
+			auto Selector = MakeShared<FJsonObject>(); Selector->SetStringField(TEXT("job_id"), GetString(Summary, TEXT("job_id")));
+			for (const auto& Item : GetArray(Service.Status(Selector), TEXT("items")))
+			{
+				const FString Journal = GetString(GetObject(Item->AsObject(), TEXT("result")), TEXT("recovery_journal"));
+				if (!Journal.IsEmpty()) Scan.Recorded.Add(CanonicalPath(FPaths::ConvertRelativePathToFull(Journal)));
+			}
+			continue;
 		}
-
-		if (!PublishStagedDirectory(StagingDirectory, FinalDirectory, Error))
+		if (!Scan.bFilesListed)
 		{
-			Result.Errors.Add(Error);
-			bKeepBackup = IFileManager::Get().DirectoryExists(*(StagingDirectory + TEXT("_Previous")));
-			CleanupStaging();
-			return Result;
+			IFileManager::Get().FindFilesRecursive(Scan.Files, *Scan.Root, TEXT("*.json"), true, false);
+			Scan.bFilesListed = true;
 		}
-		CleanupStaging();
-		Result.bSuccess = true;
-		Result.FinalDirectory = FinalDirectory;
+		if (Scan.FileIndex >= Scan.Files.Num()) return true;
+		const FString File = FPaths::ConvertRelativePathToFull(Scan.Files[Scan.FileIndex++]); const auto Data = ReadJournal(File); FString Error;
+		if (!ValidateRecoveryJournal(Data, Error)) Service.RegisterRecordIssue(File, Error);
+		else if (GetString(Data, TEXT("state")) == TEXT("publishing") && !Scan.Recorded.Contains(CanonicalPath(File)) && !HasCurrentRecoveryReference(Service, Data, File))
+			Service.RegisterRecordIssue(File, TEXT("FBX publishing journal has no owning job record."));
+	}
+	return false;
+}
+}
+void RegisterRecoveryDiagnostics() { RecoveryScan = MakeUnique<FRecoveryScan>(FPaths::ProjectSavedDir() / TEXT("FBX_Exporter/Recovery")); }
+void CancelRecoveryDiagnostics() { RecoveryScan.Reset(); }
+bool AdvanceRecoveryDiagnostics(int32 Budget)
+{
+	if (!RecoveryScan) return true;
+	if (!AdvanceRecoveryScan(*RecoveryScan, Jobs(), Budget)) return false;
+	RecoveryScan.Reset();
+	return true;
+}
+
+FPreflightResult PreflightStaticMesh(UStaticMesh* StaticMesh, const FFBXExporterOptions& Options)
+{
+	FPreflightResult Result;
+	if (!IsInGameThread())
+	{
+		Result.Errors.Add(TEXT("FBX export requires the Editor game thread."));
 		return Result;
 	}
-
-	void NotifyBatchExportResult(const FBatchExportSummary& Summary)
+	if (!StaticMesh || !StaticMesh->IsAsset())
 	{
-		if (!Summary.Errors.IsEmpty())
-		{
-			FString Message = FString::Printf(
-				TEXT("Static Mesh texture export finished: %d/%d mesh(es) exported.\n\n%s"),
-				Summary.SucceededCount,
-				Summary.RequestedCount,
-				*FString::Join(Summary.Errors, TEXT("\n")));
-			FMessageDialog::Open(
-				EAppMsgType::Ok,
-				FText::FromString(Message));
-			return;
-		}
-
-		FNotificationInfo Notification(
-			Summary.Warnings.IsEmpty()
-				? FText::Format(
-					LOCTEXT("StaticMeshTextureExportBatchSucceeded", "Exported {0} Static Mesh(es) to {1}"),
-					FText::AsNumber(Summary.SucceededCount),
-					FText::FromString(Summary.OutputRoot))
-				: FText::Format(
-					LOCTEXT("StaticMeshTextureExportBatchWithWarnings", "Exported {0} Static Mesh(es) with {1} warning(s) to {2}"),
-					FText::AsNumber(Summary.SucceededCount),
-					FText::AsNumber(Summary.Warnings.Num()),
-					FText::FromString(Summary.OutputRoot)));
-		Notification.ExpireDuration = 6.0f;
-		Notification.bFireAndForget = true;
-		FSlateNotificationManager::Get().AddNotification(Notification);
+		Result.Errors.Add(TEXT("A Static Mesh asset is required."));
+		return Result;
 	}
-
-	void ExecuteExport(const TArray<FAssetData>& AssetData, const FFBXExporterOptions& Options)
+	if (!GEditor || GEditor->PlayWorld || GEditor->bIsSimulatingInEditor)
 	{
-		FBatchExportSummary Summary;
-		Summary.RequestedCount = AssetData.Num();
-		Summary.OutputRoot = Options.OutputRoot;
-
-		TArray<UStaticMesh*> StaticMeshes;
-		TSet<FString> MeshFolderNames;
-		for (const FAssetData& Asset : AssetData)
+		Result.Errors.Add(TEXT("Stop PIE before exporting Static Meshes."));
+	}
+	if (!StaticMesh->HasValidRenderData() || StaticMesh->GetNumLODs() <= 0)
+	{
+		Result.Errors.Add(TEXT("Static Mesh has no valid LOD0 render data."));
+	}
+	else if (Options.TextureMaps != EFBXExporterTextureMap::None &&
+		StaticMesh->GetRenderData()->LODResources[0].VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords() == 0)
+	{
+		Result.Errors.Add(TEXT("Selected texture maps require UV0."));
+	}
+	if (Options.TextureMaps != EFBXExporterTextureMap::None)
+	{
+		if (Options.BakeResolution <= 0 || Options.BakeResolution > 16384)
 		{
-			UStaticMesh* StaticMesh = Cast<UStaticMesh>(Asset.GetAsset());
-			if (!StaticMesh || !StaticMesh->IsAsset())
-			{
-				Summary.Errors.Add(FString::Printf(TEXT("Not a loadable Static Mesh: %s"), *Asset.GetObjectPathString()));
-				continue;
-			}
-
-			const FString MeshFolderName = MakeSafeFileName(StaticMesh->GetName());
-			const FString MeshFolderKey = MeshFolderName.ToLower();
-			if (MeshFolderNames.Contains(MeshFolderKey))
-			{
-				Summary.Errors.Add(FString::Printf(
-					TEXT("Multiple selected assets resolve to the same output folder '%s'. Rename one asset or export it separately."),
-					*MeshFolderName));
-				continue;
-			}
-
-			MeshFolderNames.Add(MeshFolderKey);
-			StaticMeshes.Add(StaticMesh);
+			Result.Errors.Add(TEXT("Bake resolution must be between 1 and 16384 pixels."));
 		}
-
-		if (!Summary.Errors.IsEmpty())
+		if (!FApp::CanEverRender() || !GDynamicRHI || GUsingNullRHI)
 		{
-			NotifyBatchExportResult(Summary);
-			return;
+			Result.Errors.Add(TEXT("Texture export requires a rendering Editor (no -nullrhi)."));
 		}
-
-		GConfig->SetString(ConfigSection, ConfigLastOutputRoot, *Options.OutputRoot, GEditorPerProjectIni);
-		GConfig->Flush(false, GEditorPerProjectIni);
-
-		for (UStaticMesh* StaticMesh : StaticMeshes)
+	}
+	if ((static_cast<uint8>(Options.TextureMaps) & ~static_cast<uint8>(EFBXExporterTextureMap::All)) != 0)
+	{
+		Result.Errors.Add(TEXT("TextureMaps contains unsupported map bits."));
+	}
+	if (Options.OutputRoot.TrimStartAndEnd().IsEmpty())
+	{
+		Result.Errors.Add(TEXT("Output folder is empty."));
+		return Result;
+	}
+	const FString OutputRoot = FPaths::ConvertRelativePathToFull(Options.OutputRoot);
+	if (IFileManager::Get().FileExists(*OutputRoot))
+	{
+		Result.Errors.Add(TEXT("Output root is a file, not a directory."));
+	}
+	const FString MeshName = MakeSafeFileName(StaticMesh->GetName());
+	Result.FinalDirectory = OutputRoot / MeshName;
+	if (Options.OutputLayout == TEXT("asset_path"))
+	{
+		FString Package = StaticMesh->GetOutermost()->GetName(); Package.RemoveFromStart(TEXT("/"));
+		TArray<FString> Components; Package.ParseIntoArray(Components, TEXT("/"), true);
+		FString Relative;
+		for (const FString& Component : Components) Relative /= MakeSafeFileName(Component);
+		Result.FinalDirectory = OutputRoot / Relative;
+	}
+	else if (Options.OutputLayout != TEXT("mesh_name")) Result.Errors.Add(TEXT("output_layout must be mesh_name or asset_path."));
+	FPaths::NormalizeDirectoryName(Result.FinalDirectory);
+	FPaths::CollapseRelativeDirectories(Result.FinalDirectory);
+	FString Journal;
+	if (IsRecoveryBlocked(Result.FinalDirectory, Journal)) Result.Errors.Add(FString::Printf(TEXT("Output requires recovery acknowledgement before reuse: %s"), *Journal));
+	Result.FbxFile = Result.FinalDirectory / (MeshName + TEXT(".fbx"));
+	if (Options.TextureMaps != EFBXExporterTextureMap::None)
+	{
+		Result.MetadataFile = Result.FinalDirectory / (MeshName + TEXT("_Materials.json"));
+	}
+	if (IFileManager::Get().FileExists(*Result.FinalDirectory))
+	{
+		Result.Errors.Add(TEXT("The mesh output directory is blocked by a file."));
+	}
+	Result.bRequiresOverwrite = IFileManager::Get().DirectoryExists(*Result.FinalDirectory);
+	if (Result.bRequiresOverwrite)
+	{
+		Result.Warnings.Add(TEXT("Overwrite replaces the entire mesh output folder, including user files."));
+		IFileManager::Get().FindFilesRecursive(Result.ReplacedFiles, *Result.FinalDirectory, TEXT("*"), true, false);
+		Result.ReplacedFiles.Sort();
+	}
+	Result.PlannedFiles.Add(Result.FbxFile);
+	if (!Result.MetadataFile.IsEmpty()) Result.PlannedFiles.Add(Result.MetadataFile);
+	if (Options.TextureMaps != EFBXExporterTextureMap::None && StaticMesh->HasValidRenderData() && StaticMesh->GetNumLODs() > 0)
+	{
+		TArray<FFBXExporterSlotData> Slots; BuildSlotNames(StaticMesh, Slots);
+		for (const auto& Slot : Slots)
 		{
-			const FFBXExporterResult Result = ExportStaticMesh(StaticMesh, Options);
-			if (Result.Succeeded())
-			{
-				++Summary.SucceededCount;
-			}
-			else if (!Result.Errors.IsEmpty())
-			{
-				for (const FString& Error : Result.Errors)
+			if (!Slot.bHasMaterial || !StaticMesh->GetRenderData()->LODResources[0].Sections.ContainsByPredicate([&Slot](const FStaticMeshSection& Section) { return Section.MaterialIndex == Slot.SlotIndex; })) continue;
+			for (const FString& Map : GetTextureMapNames())
+				if (IsMapSelected(Options.TextureMaps, Map))
 				{
-					Summary.Errors.Add(FString::Printf(TEXT("%s: %s"), *StaticMesh->GetName(), *Error));
+					const FString PhysicalMap = Map == TEXT("Opacity") ? GetOpacityMapName(StaticMesh->GetMaterial(Slot.SlotIndex)) : Map;
+					Result.PlannedFiles.Add(Result.FinalDirectory / TEXT("Textures") / GetMapFileName(Slot.SlotName, PhysicalMap));
 				}
-			}
-			else
-			{
-				Summary.Warnings.Add(FString::Printf(TEXT("%s was skipped."), *StaticMesh->GetName()));
-			}
-
-			for (const FString& Warning : Result.Warnings)
-			{
-				Summary.Warnings.Add(FString::Printf(TEXT("%s: %s"), *StaticMesh->GetName(), *Warning));
-			}
 		}
-
-		NotifyBatchExportResult(Summary);
 	}
+	Result.PlannedFiles.Sort();
+	Result.bCanExport = Result.Errors.IsEmpty();
+	return Result;
+}
+
+FFBXExporterResult ExportStaticMeshUnattended(UStaticMesh* StaticMesh, const FFBXExporterOptions& Options, const bool bOverwrite)
+{
+	FFBXExporterResult Result;
+	if (!StaticMesh) { Result.Errors.Add(TEXT("A Static Mesh asset is required.")); return Result; }
+	UnrealToolsRuntime::FItemSpec Spec; Spec.MeshPath = StaticMesh->GetPathName(); Spec.Options = OptionsToJson(Options); Spec.bOverwrite = bOverwrite;
+	FString Error;
+	const auto Data = Jobs().RunInline(Spec, Error);
+	if (!Data.IsValid()) { Result.Errors.Add(Error); return Result; }
+	Result.bSuccess = UnrealToolsRuntime::GetBool(Data, TEXT("success")); Result.FinalDirectory = UnrealToolsRuntime::GetString(Data, TEXT("final_directory"));
+	for (const auto& Value : UnrealToolsRuntime::GetArray(Data, TEXT("errors"))) Result.Errors.Add(Value->AsString());
+	for (const auto& Value : UnrealToolsRuntime::GetArray(Data, TEXT("warnings"))) Result.Warnings.Add(Value->AsString());
+	if (!Result.bSuccess && Result.Errors.IsEmpty()) Result.Errors.Add(UnrealToolsRuntime::GetString(Data, TEXT("error"), Error));
+	Result.RecoveryJournal = UnrealToolsRuntime::GetString(Data, TEXT("recovery_journal")); Result.RecoveryStaging = UnrealToolsRuntime::GetString(Data, TEXT("recovery_staging")); Result.RecoveryBackup = UnrealToolsRuntime::GetString(Data, TEXT("recovery_backup"));
+	return Result;
 }
 
 namespace Testing
@@ -1602,6 +1914,22 @@ namespace Testing
 	{
 		return PublishStagedDirectory(StagingDirectory, FinalDirectory, OutError);
 	}
+	bool PublishWithJournal(const FString& Stage, const FString& Final, const FString& Journal, FString& Error, const FString& JobId)
+	{ return PublishStagedDirectory(Stage, Final, Error, Journal, JobId); }
+	void ScanRecoveryDiagnostics(UnrealToolsRuntime::FJobService& Service, const FString& RecoveryRoot, const TFunction<void()>& BeforeFileScan)
+	{
+		FRecoveryScan Scan(RecoveryRoot);
+		while (!Scan.bJobsDone) if (AdvanceRecoveryScan(Scan, Service, 1)) return;
+		if (BeforeFileScan) BeforeFileScan();
+		while (!AdvanceRecoveryScan(Scan, Service, 8)) {}
+	}
+	void SetPublishFailure(const FString& FailurePoint) { PublishFailurePoint = FailurePoint; }
+	bool ReadLinearTexture(UTexture2D* Texture, int32 Width, int32 Height, TArray<FLinearColor>& Pixels)
+	{ return LoadTextureLinearPixels(Texture, Width, Height, Texture && Texture->SRGB, Pixels); }
+	bool ReadDirectEmission(UTexture2D* Texture, int32 Width, int32 Height, TArray<FColor>& Pixels, float& Scale)
+	{ FDirectTextureBinding Binding; Binding.Texture = Texture; return LoadDirectTexturePixels(Binding, Width, Height, true, Pixels, &Scale); }
+	bool IsDirectTextureReusable(UMaterialInterface* Material, const FString& Property)
+	{ FDirectTextureBinding Binding; return FindDirectTexture(Material, Property == TEXT("Metallic") ? MP_Metallic : MP_EmissiveColor, Binding); }
 }
 
 FString MakeSafeFileName(const FString& InName)
@@ -1616,6 +1944,11 @@ FString MakeSafeFileName(const FString& InName)
 			Result[Index] = TEXT('_');
 		}
 	}
+	while (Result.EndsWith(TEXT(".")) || Result.EndsWith(TEXT(" "))) Result.LeftChopInline(1);
+	const FString Base = FPaths::GetBaseFilename(Result).ToUpper();
+	const bool bReserved = Base == TEXT("CON") || Base == TEXT("PRN") || Base == TEXT("AUX") || Base == TEXT("NUL")
+		|| (Base.Len() == 4 && (Base.StartsWith(TEXT("COM")) || Base.StartsWith(TEXT("LPT"))) && Base[3] >= TEXT('1') && Base[3] <= TEXT('9'));
+	if (bReserved) Result = TEXT("_") + Result;
 	return Result.IsEmpty() || Result == TEXT(".") || Result == TEXT("..") ? TEXT("Unnamed") : Result;
 }
 
@@ -1696,312 +2029,13 @@ void PopulateContentBrowserMenu(UToolMenu* Menu)
 		})));
 }
 
+FString LastOutputRoot() { return GetLastOutputRoot(); }
+
 void ShowExportDialog(const TArray<FAssetData>& SelectedAssets)
 {
-	if (SelectedAssets.IsEmpty())
-	{
-		return;
-	}
-
-	FString LastOutputRoot = GetLastOutputRoot();
-	if (LastOutputRoot.IsEmpty())
-	{
-		LastOutputRoot = FPaths::ProjectDir() / TEXT("Exports/StaticMeshTextures");
-	}
-
-	TSharedRef<FExportDialogState> State = MakeShared<FExportDialogState>();
-	State->OutputRoot = LastOutputRoot;
-
-	TArray<TSharedPtr<int32>> ResolutionOptions;
-	for (const int32 Resolution : {512, 1024, 2048, 4096})
-	{
-		ResolutionOptions.Add(MakeShared<int32>(Resolution));
-	}
-	TSharedPtr<int32> SelectedResolution = ResolutionOptions[2];
-	TSharedPtr<SEditableTextBox> OutputTextBox;
-	TSharedPtr<STextBlock> ResolutionText;
-	TSharedPtr<SWindow> Window;
-
-	SAssignNew(Window, SWindow)
-		.Title(LOCTEXT("FBXExporterWindowTitle", "FBX_Exporter"))
-		.ClientSize(FVector2D(720.0f, 500.0f))
-		.SupportsMaximize(false)
-		.SupportsMinimize(false);
-
-	Window->SetContent(
-		SNew(SBorder)
-		.Padding(16.0f)
-		[
-			SNew(SVerticalBox)
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
-			[
-				SNew(STextBlock).Text(FText::Format(
-					LOCTEXT("SourceStaticMeshes", "Selected Static Meshes: {0}\nEach mesh is exported to its own folder below the output root."),
-					FText::AsNumber(SelectedAssets.Num())))
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
-			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().FillWidth(1.0f)
-				[
-					SAssignNew(OutputTextBox, SEditableTextBox)
-					.Text(FText::FromString(State->OutputRoot))
-				]
-				+ SHorizontalBox::Slot().AutoWidth().Padding(8.0f, 0.0f, 0.0f, 0.0f)
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("BrowseOutputFolder", "Browse..."))
-					.OnClicked_Lambda([OutputTextBox]()
-					{
-						if (IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get())
-						{
-							FString SelectedFolder;
-							const void* ParentWindowHandle = FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr);
-							if (DesktopPlatform->OpenDirectoryDialog(
-								ParentWindowHandle,
-								LOCTEXT("SelectStaticMeshTextureOutputFolder", "Select Static Mesh Texture Export Folder").ToString(),
-								OutputTextBox->GetText().ToString(),
-								SelectedFolder))
-							{
-								OutputTextBox->SetText(FText::FromString(SelectedFolder));
-							}
-						}
-						return FReply::Handled();
-					})
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 8.0f)
-			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center)
-				[
-					SNew(STextBlock).Text(LOCTEXT("BakeResolutionLabel", "PBR Bake Resolution"))
-				]
-				+ SHorizontalBox::Slot().AutoWidth().Padding(16.0f, 0.0f, 0.0f, 0.0f)
-				[
-					SNew(SComboBox<TSharedPtr<int32>>)
-					.OptionsSource(&ResolutionOptions)
-					.InitiallySelectedItem(SelectedResolution)
-					.OnGenerateWidget_Lambda([](TSharedPtr<int32> Value)
-					{
-						return SNew(STextBlock).Text(FText::AsNumber(Value.IsValid() ? *Value : 2048));
-					})
-					.OnSelectionChanged_Lambda([State, &SelectedResolution, &ResolutionText](TSharedPtr<int32> Value, ESelectInfo::Type)
-					{
-						if (Value.IsValid())
-						{
-							SelectedResolution = Value;
-							State->BakeResolution = *Value;
-							if (ResolutionText.IsValid())
-							{
-								ResolutionText->SetText(FText::AsNumber(*Value));
-							}
-						}
-					})
-					[
-						SAssignNew(ResolutionText, STextBlock).Text(FText::AsNumber(*SelectedResolution))
-					]
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
-			[
-				SNew(SCheckBox)
-				.IsChecked(ECheckBoxState::Checked)
-				.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-				{
-					State->bReuseDirectTextures = NewState == ECheckBoxState::Checked;
-				})
-				[
-					SNew(STextBlock).Text(LOCTEXT("ReuseDirectTextures", "Reuse directly connected source textures when available"))
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 4.0f)
-			[
-				SNew(STextBlock).Text(LOCTEXT("TextureMapsLabel", "Texture maps"))
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SUniformGridPanel)
-				.SlotPadding(FMargin(4.0f, 2.0f))
-				+ SUniformGridPanel::Slot(0, 0)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::BaseColor) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::BaseColor;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::BaseColor));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("BaseColorMap", "Base Color"))
-					]
-				]
-				+ SUniformGridPanel::Slot(1, 0)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Normal) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Normal;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Normal));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("NormalMap", "Normal"))
-					]
-				]
-				+ SUniformGridPanel::Slot(2, 0)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Mask) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Mask;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Mask));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("MaskMap", "Mask"))
-					]
-				]
-				+ SUniformGridPanel::Slot(3, 0)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Occlusion) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Occlusion;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Occlusion));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("OcclusionMap", "Occlusion"))
-					]
-				]
-				+ SUniformGridPanel::Slot(0, 1)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Emission) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Emission;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Emission));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("EmissionMap", "Emission"))
-					]
-				]
-				+ SUniformGridPanel::Slot(1, 1)
-				[
-					SNew(SCheckBox)
-					.IsChecked_Lambda([State]() { return IsFBXExporterTextureMapEnabled(State->TextureMaps, EFBXExporterTextureMap::Opacity) ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-					.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-					{
-						if (NewState == ECheckBoxState::Checked) State->TextureMaps |= EFBXExporterTextureMap::Opacity;
-						else State->TextureMaps &= static_cast<EFBXExporterTextureMap>(~static_cast<uint8>(EFBXExporterTextureMap::Opacity));
-					})
-					[
-						SNew(STextBlock).Text(LOCTEXT("OpacityMap", "Opacity / Opacity Mask"))
-					]
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 4.0f, 0.0f, 4.0f)
-			[
-				SNew(SHorizontalBox)
-				+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 8.0f, 0.0f)
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("SelectAllTextureMaps", "Select All"))
-					.OnClicked_Lambda([State]()
-					{
-						State->TextureMaps = EFBXExporterTextureMap::All;
-						return FReply::Handled();
-					})
-				]
-				+ SHorizontalBox::Slot().AutoWidth()
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("ClearAllTextureMaps", "Clear All"))
-					.OnClicked_Lambda([State]()
-					{
-						State->TextureMaps = EFBXExporterTextureMap::None;
-						return FReply::Handled();
-					})
-				]
-			]
-			+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 4.0f)
-			[
-				SNew(SCheckBox)
-				.IsChecked_Lambda([State]() { return State->bEmbedTexturesInFbx ? ECheckBoxState::Checked : ECheckBoxState::Unchecked; })
-				.IsEnabled_Lambda([State]() { return State->TextureMaps != EFBXExporterTextureMap::None; })
-				.OnCheckStateChanged_Lambda([State](ECheckBoxState NewState)
-				{
-					State->bEmbedTexturesInFbx = NewState == ECheckBoxState::Checked;
-				})
-				[
-					SNew(STextBlock).Text(LOCTEXT("EmbedTexturesInFbx", "Embed selected textures in FBX"))
-				]
-			]
-			+ SVerticalBox::Slot().FillHeight(1.0f)
-			[
-				SNew(STextBlock).Text(LOCTEXT(
-					"StaticMeshTextureExportDescription",
-					"Selected maps are baked or directly reused from UV0. The export creates an FBX, selected PNGs under Textures, and a versioned material JSON file. The Unreal asset is not modified."))
-			]
-			+ SVerticalBox::Slot().AutoHeight()
-			[
-				SNew(SUniformGridPanel)
-				.SlotPadding(FMargin(8.0f, 0.0f))
-				+ SUniformGridPanel::Slot(0, 0)
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("CancelStaticMeshTextureExport", "Cancel"))
-					.OnClicked_Lambda([Window]()
-					{
-						Window->RequestDestroyWindow();
-						return FReply::Handled();
-					})
-				]
-				+ SUniformGridPanel::Slot(1, 0)
-				[
-					SNew(SButton)
-					.Text(LOCTEXT("RunStaticMeshTextureExport", "Export"))
-					.OnClicked_Lambda([Window, State, OutputTextBox]()
-					{
-						State->OutputRoot = OutputTextBox->GetText().ToString().TrimStartAndEnd();
-						if (State->OutputRoot.IsEmpty())
-						{
-							FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("MissingUnityOutputFolder", "Select an output folder first."));
-							return FReply::Handled();
-						}
-						if (State->BakeResolution <= 0)
-						{
-							State->BakeResolution = 2048;
-						}
-						State->bAccepted = true;
-						Window->RequestDestroyWindow();
-						return FReply::Handled();
-					})
-				]
-			]
-		]);
-
-	TSharedPtr<SWindow> ParentWindow;
-	if (FModuleManager::Get().IsModuleLoaded(TEXT("MainFrame")))
-	{
-		ParentWindow = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame")).GetParentWindow();
-	}
-	FSlateApplication::Get().AddModalWindow(Window.ToSharedRef(), ParentWindow, false);
-	if (!State->bAccepted)
-	{
-		return;
-	}
-
-	FFBXExporterOptions Options;
-	Options.OutputRoot = State->OutputRoot;
-	Options.BakeResolution = State->BakeResolution;
-	Options.bReuseDirectTextures = State->bReuseDirectTextures;
-	Options.TextureMaps = State->TextureMaps;
-	Options.bEmbedTexturesInFbx = State->bEmbedTexturesInFbx;
-	ExecuteExport(SelectedAssets, Options);
+	AddAssetsToTab(SelectedAssets);
 }
+
 }
 
 #undef LOCTEXT_NAMESPACE
