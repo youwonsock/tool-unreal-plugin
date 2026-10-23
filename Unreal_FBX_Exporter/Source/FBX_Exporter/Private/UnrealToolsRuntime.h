@@ -3,6 +3,7 @@
 // Canonical source: tool-unreal-plugin/Shared/Native/UnrealToolsRuntime.h.
 // Scripts/sync_runtime.py vendors this header into each independent Editor plugin.
 #include "CoreMinimal.h"
+#include "UnrealToolsServiceInstance.h"
 #include "Containers/Ticker.h"
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
@@ -459,6 +460,7 @@ public:
     bool IsBusy() const { return !Queue.IsEmpty() || Runner.IsValid() || bStepping; }
     bool IsInitialScanComplete() const { return bInitialScanComplete; }
     uint64 GetRevision() const { return Revision; }
+    uint64 GetInstanceGeneration() const { return InstanceGeneration; }
     uint64 GetJobRevision(const FString& Id) const { return JobRevisions.FindRef(Id); }
     void PinJob(const FString& Id) { ++Pins.FindOrAdd(Id); }
     void UnpinJob(const FString& Id) { if (int32* Count = Pins.Find(Id)) { if (--*Count <= 0) Pins.Remove(Id); } bMaintenanceDue = true; }
@@ -555,6 +557,7 @@ public:
     void RunMaintenanceForTesting(int32 Budget = 10) { PlanMaintenance(); Maintain(Budget); }
     int32 GetCachedRecordCountForTesting() const { return Records.Num(); }
     int32 GetSnapshotBuildCountForTesting() const { return SnapshotBuilds; }
+    int32 GetJobPinCountForTesting(const FString& Id) const { return Pins.FindRef(Id); }
 #endif
     TArray<FObject> GetJobs() const
     {
@@ -1422,6 +1425,7 @@ private:
         Completion(Clone(Result));
     }
     struct FMaintenanceTask { FString Id; int32 Action = 0; };
+    const uint64 InstanceGeneration = NextServiceInstanceGeneration();
     FString Provider, Root, StorageRoot;
     FProfileStore& Profiles;
     FObject Defaults;

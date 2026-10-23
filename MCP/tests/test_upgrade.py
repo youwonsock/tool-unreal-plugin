@@ -227,6 +227,9 @@ class UpgradeTests(ProjectCase):
         native.mkdir(parents=True)
         (native / "UnrealToolsRuntime.h").write_text("// fixture header", "utf-8")
         (native / "UnrealToolsRuntimeTests.inl").write_text("// fixture tests", "utf-8")
+        (native / "UnrealToolsWorkspace.h").write_text("// workspace fixture", "utf-8")
+        (native / "UnrealToolsWorkspaceController.h").write_text("// adapter fixture", "utf-8")
+        (native / "UnrealToolsServiceInstance.h").write_text("// instance fixture", "utf-8")
         obsolete = self.cube.manifest.parent / "unreal_tools_mcp/obsolete.py"
         obsolete.write_text("# stale", "utf-8")
         with patch.object(sync_runtime, "MCP_SOURCE", source), patch.object(sync_runtime, "NATIVE_SOURCE", native):
@@ -240,6 +243,15 @@ class UpgradeTests(ProjectCase):
             self.assertFalse((package / "cache.pyc").exists())
             header = provider.manifest.parents[1] / f"Source/{provider.plugin}/Private/UnrealToolsRuntime.h"
             self.assertEqual(header.read_text("utf-8"), "// fixture header")
+            workspace = header.with_name("UnrealToolsWorkspace.h")
+            self.assertEqual(workspace.read_text("utf-8"), "// workspace fixture")
+            instance = header.with_name("UnrealToolsServiceInstance.h")
+            self.assertEqual(instance.read_text("utf-8"), "// instance fixture")
+            for managed_header in [workspace, instance]:
+                managed_header.write_text("// drift", "utf-8")
+                with patch.object(sync_runtime, "MCP_SOURCE", source), patch.object(sync_runtime, "NATIVE_SOURCE", native):
+                    self.assertEqual(self.quiet(sync_runtime.synchronize, self.root / "Plugins", check=True), 1)
+                    self.assertEqual(self.quiet(sync_runtime.synchronize, self.root / "Plugins"), 0)
 
     def test_missing_shared_native_source_fails_before_deploying_python(self):
         native = Path(self.temp.name) / "missing-native"

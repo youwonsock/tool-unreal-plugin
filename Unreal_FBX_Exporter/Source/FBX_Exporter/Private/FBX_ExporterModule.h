@@ -2,14 +2,20 @@
 
 #include "Modules/ModuleManager.h"
 
+class FFBXExporterWorkspaceController;
+
 class FFBXExporterModule final : public IModuleInterface
 {
 public:
-	virtual void StartupModule() override;
-	virtual void ShutdownModule() override;
-	// Posted MCP callbacks and codec workers must finish before code is unloaded.
-	virtual bool SupportsDynamicReloading() override { return false; }
+    virtual void StartupModule() override;
+    virtual void ShutdownModule() override;
+    // Posted MCP callbacks and codec workers must finish before code is unloaded.
+    virtual bool SupportsDynamicReloading() override
+    {
+        return false;
+    }
 
 private:
-	void RegisterMenus();
+    void RegisterMenus();
+    TSharedPtr<FFBXExporterWorkspaceController> Workspace;
 };

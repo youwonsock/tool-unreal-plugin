@@ -1,8 +1,11 @@
 // Included once per plugin; these tests require no RHI or project content.
 #if WITH_DEV_AUTOMATION_TESTS
 #include "UnrealToolsRuntime.h"
+#include "UnrealToolsWorkspaceController.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
 #include "Modules/ModuleManager.h"
+#include <new>
 
 // UE registers tests by the C++ class name, independently of PrettyName. Expand
 // the provider prefix before entering UE's #TClass/##TClass registration macro.
@@ -890,6 +893,166 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeMaintenanceRevalidationTest)::RunTest(con
     }
     return true;
 }
+UNREAL_TOOLS_RUNTIME_IMPLEMENT(RuntimeWorkspaceHistoryCacheTest, UNREAL_TOOLS_TEST_PREFIX ".WorkspaceHistoryCache",
+                               EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeWorkspaceHistoryCacheTest)::RunTest(const FString&)
+{
+    using namespace UnrealToolsRuntime;
+    FRuntimeFixture Fixture;
+    auto Model = MakeShared<UnrealToolsWorkspace::FController>(
+        Fixture.Defaults, TEXT("fixture"), [](FObject&, FString&) { return true; },
+        [&]() -> FProfileStore& { return Fixture.Profiles; }, [&]() -> FJobService& { return *Fixture.Jobs; });
+    const FString A = GetString(Fixture.Jobs->Start(Fixture.Input()), TEXT("job_id"));
+    const FString B = GetString(Fixture.Jobs->Start(Fixture.Input({TEXT("/Game/CacheB.CacheB")})), TEXT("job_id"));
+    if (!TestTrue(TEXT("Two isolated fake jobs were admitted"), !A.IsEmpty() && !B.IsEmpty()))
+        return false;
+    Model->SelectJob(B);
+    const auto BRevision = Fixture.Jobs->GetJobRevision(B);
+    const auto Reads = Model->History().ResultReads;
+    const auto ResultRevision = Model->History().ResultRevision;
+    const auto Cached = Model->History().Selected;
+    const auto Json = Model->History().Json;
+    Fixture.Jobs->AdvanceOneStepForTesting(); // Only A advances; selected B is still queued.
+    TestEqual(TEXT("Unselected work does not change B's revision"), Fixture.Jobs->GetJobRevision(B), BRevision);
+    Model->RefreshHistory();
+    TestEqual(TEXT("Unselected progress does not reread B"), Model->History().ResultReads, Reads);
+    TestEqual(TEXT("Unselected progress does not invalidate the result text"), Model->History().ResultRevision,
+              ResultRevision);
+    TestTrue(TEXT("Unselected progress reuses the selected JSON object"),
+             Model->History().Selected.Get() == Cached.Get());
+    TestEqual(TEXT("Unselected progress reuses formatted result data"), Model->History().Json, Json);
+    Model->SelectJob(A);
+    const auto AfterA = Model->History().ResultReads;
+    Model->SelectJob(B);
+    TestEqual(TEXT("Switching back reuses B's per-job cache"), Model->History().ResultReads, AfterA);
+    Model->SelectJob(A);
+    TestEqual(TEXT("Switching back reuses A's per-job cache"), Model->History().ResultReads, AfterA);
+    Fixture.Jobs->AdvanceOneStepForTesting();
+    Model->RefreshHistory();
+    TestEqual(TEXT("Selected progress refreshes its own snapshot"), Model->History().ResultReads, AfterA + 1);
+    const auto BeforeForce = Model->History().ResultReads;
+    Model->RefreshHistory(true);
+    TestEqual(TEXT("Explicit refresh rechecks status and external annotations"), Model->History().ResultReads,
+              BeforeForce + 1);
+    // Bound the cache while retaining its most recently selected entry.
+    for (int32 Index = 0; Index < 21; ++Index)
+    {
+        const auto Path = FString::Printf(TEXT("/Game/Cache%d.Cache%d"), Index, Index);
+        const auto Id = GetString(Fixture.Jobs->Start(Fixture.Input({Path})), TEXT("job_id"));
+        if (!TestTrue(TEXT("Cache eviction fixture admitted"), !Id.IsEmpty()))
+            return false;
+        Model->SelectJob(Id);
+    }
+    const auto BeforeEvictionRead = Model->History().ResultReads;
+    Model->SelectJob(A);
+    TestEqual(TEXT("The oldest result is evicted after twenty cached jobs"), Model->History().ResultReads,
+              BeforeEvictionRead + 1);
+    Model->Shutdown();
+    return true;
+}
+
+UNREAL_TOOLS_RUNTIME_IMPLEMENT(RuntimeWorkspaceServiceGenerationTest,
+                               UNREAL_TOOLS_TEST_PREFIX ".WorkspaceServiceGeneration",
+                               EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeWorkspaceServiceGenerationTest)::RunTest(const FString&)
+{
+    using namespace UnrealToolsRuntime;
+    FRuntimeFixture Fixture;
+    Fixture.Jobs.Reset();
+    alignas(FJobService) uint8 Storage[sizeof(FJobService)];
+    FJobService* Service = nullptr;
+    // This guard precedes Model, so the controller releases its view/pin before
+    // the final service and the fixture's isolated metadata are destroyed.
+    ON_SCOPE_EXIT
+    {
+        if (Service)
+            Service->~FJobService();
+    };
+    const auto Recreate = [&]() {
+        if (Service)
+        {
+            Service->~FJobService(); // Persists a queued job as interrupted.
+            Service = nullptr;
+        }
+        Service = new (static_cast<void*>(Storage)) FJobService(
+            TEXT("runtime_test"), Fixture.Name, Fixture.Profiles, Fixture.Defaults,
+            [](FObject&, FString&) { return true; },
+            [&](const FItemSpec& Spec) {
+                return TArray<FString>{
+                    Fixture.Root / TEXT("Outputs") /
+                    FPackageName::GetShortName(FPackageName::ObjectPathToPackageName(Spec.MeshPath))};
+            },
+            [](const FItemSpec& Spec, const FString&) -> TUniquePtr<IItemRunner> {
+                return MakeUnique<FRuntimeFakeRunner>(Spec);
+            });
+    };
+    Recreate();
+    auto Model = MakeShared<UnrealToolsWorkspace::FController>(
+        Fixture.Defaults, TEXT("fixture"), [](FObject&, FString&) { return true; },
+        [&]() -> FProfileStore& { return Fixture.Profiles; }, [&]() -> FJobService& { return *Service; });
+    Model->AttachView();
+    const auto Id = GetString(Service->Start(Fixture.Input()), TEXT("job_id"));
+    if (!TestTrue(TEXT("An isolated fake job is queued"), !Id.IsEmpty()))
+        return false;
+    Model->SelectJob(Id);
+    const auto OldSnapshot = Model->History().Selected;
+    const auto Address = static_cast<const void*>(Service);
+    const auto Generation = Service->GetInstanceGeneration();
+    const auto Revision = Service->GetRevision();
+    const auto JobRevision = Service->GetJobRevision(Id);
+    const auto Reads = Model->History().ResultReads;
+    const auto ResultRevision = Model->History().ResultRevision;
+    TestEqual(TEXT("The original view owns one pin"), Service->GetJobPinCountForTesting(Id), 1);
+    TestEqual(TEXT("The original displayed snapshot is queued"), GetString(OldSnapshot, TEXT("state")),
+              FString(TEXT("queued")));
+    Recreate();
+    TestTrue(TEXT("The real service reuses exactly the same storage"), static_cast<const void*>(Service) == Address);
+    TestTrue(TEXT("Reconstruction advances the instance generation"), Service->GetInstanceGeneration() > Generation);
+    TestEqual(TEXT("The recreated service deliberately has the same global revision"), Service->GetRevision(),
+              Revision);
+    TestEqual(TEXT("The retained job also has the same revision"), Service->GetJobRevision(Id), JobRevision);
+    TestEqual(TEXT("Pins belong to the destroyed instance"), Service->GetJobPinCountForTesting(Id), 0);
+    Service->PinJob(Id);     // A different observer in the new service.
+    Model->RefreshHistory(); // No force: only the generation distinguishes it.
+    TestEqual(TEXT("A new generation reloads the result despite equal address and revisions"),
+              Model->History().ResultReads, Reads + 1);
+    TestEqual(TEXT("The new interrupted result is displayed"), GetString(Model->History().Selected, TEXT("state")),
+              FString(TEXT("interrupted")));
+    TestTrue(TEXT("The old cached JSON object is not reused"), Model->History().Selected.Get() != OldSnapshot.Get());
+    TestTrue(TEXT("Result text receives a new display revision"), Model->History().ResultRevision > ResultRevision);
+    TestEqual(TEXT("Replacing the service does not mutate detached snapshots"), GetString(OldSnapshot, TEXT("state")),
+              FString(TEXT("queued")));
+    TestEqual(TEXT("The view adds its pin without decrementing the other observer"),
+              Service->GetJobPinCountForTesting(Id), 2);
+    TestFalse(TEXT("The generation is absent from external job replies"),
+              Model->History().Selected->HasField(TEXT("instance_generation")));
+    const auto FreshReads = Model->History().ResultReads;
+    Model->RefreshHistory();
+    TestEqual(TEXT("Stable generations keep using the result cache"), Model->History().ResultReads, FreshReads);
+    TestEqual(TEXT("Repeated refresh never duplicates the view pin"), Service->GetJobPinCountForTesting(Id), 2);
+    Model->DetachView();
+    TestEqual(TEXT("Detach releases only the view's pin"), Service->GetJobPinCountForTesting(Id), 1);
+    Model->AttachView();
+    TestEqual(TEXT("Reopening the view registers one pin"), Service->GetJobPinCountForTesting(Id), 2);
+    Recreate();
+    Service->PinJob(Id);
+    Model->DetachView(); // Replacement happened before any history refresh.
+    TestEqual(TEXT("Detach before refresh cannot unpin another observer in the new generation"),
+              Service->GetJobPinCountForTesting(Id), 1);
+    Model->RefreshHistory();
+    TestEqual(TEXT("A detached controller does not pin on generation changes"), Service->GetJobPinCountForTesting(Id),
+              1);
+    Model->AttachView();
+    TestEqual(TEXT("Reattached views pin the new generation"), Service->GetJobPinCountForTesting(Id), 2);
+    Recreate();
+    Service->PinJob(Id);
+    Model->Shutdown(); // The same protection is needed for module shutdown.
+    TestEqual(TEXT("Shutdown before refresh preserves pins owned by the new service"),
+              Service->GetJobPinCountForTesting(Id), 1);
+    Service->UnpinJob(Id);
+    return true;
+}
+
 #undef UNREAL_TOOLS_RUNTIME_IMPLEMENT
 #undef UNREAL_TOOLS_RUNTIME_IMPLEMENT_INNER
 #undef UNREAL_TOOLS_RUNTIME_CLASS

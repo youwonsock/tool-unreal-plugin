@@ -4,6 +4,7 @@
 #include "FBX_ExporterTypes.h"
 #include "UnrealToolsRuntime.h"
 
+class FFBXExporterWorkspaceController;
 class UToolMenu;
 class UStaticMesh;
 class UTexture2D;
@@ -49,7 +50,7 @@ namespace FBXExporter
 	FFBXExporterOptions OptionsFromJson(const UnrealToolsRuntime::FObject& Json);
 	UnrealToolsRuntime::FObject OptionsToJson(const FFBXExporterOptions& Options);
 	FString PlannedDirectory(const FString& MeshPath, const FFBXExporterOptions& Options);
-	void RegisterTab();
+	void RegisterTab(TSharedRef<FFBXExporterWorkspaceController> Workspace);
 	void UnregisterTab();
 	void AddAssetsToTab(const TArray<FAssetData>& Assets);
 	FString LastOutputRoot();

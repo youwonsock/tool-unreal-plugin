@@ -20,7 +20,7 @@ class ProjectCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="unreal-tools-mcp-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "Other Project"
+        self.root = (Path(self.temp.name) / "Other Project").resolve()
         self.root.mkdir()
         self.project = self.root / "Other.uproject"
         self.write_project({"FileVersion": 3})

@@ -11,9 +11,111 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "Widgets/SWindow.h"
+#include "Widgets/Text/STextBlock.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotClosedProfileDialogTest, "CubeShot.Editor.UI.ProfileDialogAfterShutdown",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FCubeShotClosedProfileDialogTest::RunTest(const FString&)
+{
+    using namespace UnrealToolsRuntime;
+    if (!FSlateApplication::IsInitialized())
+    {
+        AddWarning(TEXT("This regression needs an initialized Slate application."));
+        return true;
+    }
+    for (int32 Variant = 0; Variant < 3; ++Variant)
+    {
+        auto Model = MakeShared<FCubeShotWorkspaceController>();
+        auto Panel = SNew(SCubeShotPanel).Workspace(Model);
+        const FString Path = TEXT("/Engine/BasicShapes/Cube.Cube");
+        Panel->AddTargetForAutomation(Path);
+        const auto Id = TEXT("closed_dialog_") + FGuid::NewGuid().ToString(EGuidFormats::Digits).ToLower();
+        const auto File = FPaths::ProjectSavedDir() / TEXT("CubeShot/Profiles") / (Id + TEXT(".json"));
+        ON_SCOPE_EXIT
+        {
+            IFileManager::Get().Delete(*File);
+        };
+        if (!TestTrue(TEXT("Create an isolated user profile for the production replacement path"),
+                      GetBool(Model->SaveActiveProfile(Id, []() { return true; }), TEXT("success"))))
+            return false;
+        Panel->ApplyProfileForAutomation(Id);
+        const auto Before = JsonText(Model->CopyOptions(Path));
+        int32 Prompts = 0;
+        Panel->SetProfileReplacementForAutomation([&]() {
+            ++Prompts;
+            Panel->Shutdown();
+            if (Variant == 1)
+                Model->Shutdown();
+            return Variant != 2;
+        });
+        Panel->SaveProfileForAutomation();
+        TestEqual(TEXT("The production save path reached replacement confirmation"), Prompts, 1);
+        TestFalse(TEXT("Returning from confirmation cannot recreate a closed view or preview service"),
+                  Panel->HasViewResourcesForAutomation());
+        TestEqual(TEXT("Closing a view preserves the row's options"), JsonText(Model->CopyOptions(Path)), Before);
+        if (Variant != 1)
+            TestTrue(TEXT("A session workspace remains usable after its view closes"), Model->BuildRequest().IsValid());
+        Panel->Shutdown();
+    }
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotLiveRowLabelTest, "CubeShot.Editor.UI.LiveModifiedLabel",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FCubeShotLiveRowLabelTest::RunTest(const FString&)
+{
+    if (!FSlateApplication::IsInitialized())
+    {
+        AddWarning(TEXT("This regression needs an initialized Slate application."));
+        return true;
+    }
+    auto Model = MakeShared<FCubeShotWorkspaceController>();
+    auto Panel = SNew(SCubeShotPanel).Workspace(Model);
+    const FString Path = TEXT("/Engine/BasicShapes/Cube.Cube");
+    Panel->AddTargetForAutomation(Path);
+    Panel->Invalidate(EInvalidateWidgetReason::Layout);
+    Panel->SlatePrepass();
+    TFunction<TSharedPtr<STextBlock>(TSharedRef<SWidget>)> FindLabel;
+    FindLabel = [&](TSharedRef<SWidget> Widget) -> TSharedPtr<STextBlock> {
+        if (Widget->GetType() == FName(TEXT("STextBlock")))
+        {
+            auto Text = StaticCastSharedRef<STextBlock>(Widget);
+            if (Text->GetText().ToString() == TEXT("Cube"))
+                return Text;
+        }
+        auto* Children = Widget->GetChildren();
+        for (int32 Index = 0; Index < Children->Num(); ++Index)
+            if (auto Found = FindLabel(Children->GetChildAt(Index)))
+                return Found;
+        return nullptr;
+    };
+    auto Label = FindLabel(Panel);
+    if (!TestTrue(TEXT("Find the production row label"), Label.IsValid()))
+        return false;
+    Panel->SetResolutionForAutomation(512);
+    Panel->Invalidate(EInvalidateWidgetReason::Layout);
+    Panel->SlatePrepass();
+    TestEqual(TEXT("The same row widget immediately shows a typed edit"), Label->GetText().ToString(),
+              FString(TEXT("Cube *")));
+    const auto Builds = Model->PresentationBuilds();
+    for (int32 Index = 0; Index < 50; ++Index)
+    {
+        Panel->Invalidate(EInvalidateWidgetReason::Layout);
+        Panel->SlatePrepass();
+    }
+    TestEqual(TEXT("Repeated label reads reuse the presentation cache"), Model->PresentationBuilds(), Builds);
+    Model->Reset(Path);
+    Panel->Invalidate(EInvalidateWidgetReason::Layout);
+    Panel->SlatePrepass();
+    TestEqual(TEXT("An explicit reset updates the same row widget"), Label->GetText().ToString(),
+              FString(TEXT("Cube")));
+    Panel->Shutdown();
+    return true;
+}
+
 namespace
 {
     void VerifyDiagnosticResults(FAutomationTestBase& Test, const TSharedPtr<SCubeShotPanel>& Panel)
@@ -60,6 +162,7 @@ namespace
         FAutomationTestBase* Test;
         TSharedPtr<SWindow> Window;
         TSharedPtr<SCubeShotPanel> Panel;
+        TSharedPtr<FCubeShotWorkspaceController> Workspace;
         double Deadline=0;
         int32 Phase=0;
         FText OriginalResults;
@@ -70,7 +173,7 @@ namespace
         {
             if(Phase==0)
             {
-                Panel=SNew(SCubeShotPanel);Panel->AddTargetForAutomation(TEXT("/Engine/BasicShapes/Cube.Cube"));
+                if(!Workspace)Workspace=MakeShared<FCubeShotWorkspaceController>();Panel=SNew(SCubeShotPanel).Workspace(Workspace);Panel->AddTargetForAutomation(TEXT("/Engine/BasicShapes/Cube.Cube"));
                 const auto History=CubeShot::Service::Jobs().GetJobSummaries();
                 if(!History.IsEmpty())Panel->SelectJobForAutomation(History[FMath::Min(1,History.Num()-1)]->GetStringField(TEXT("job_id")));
                 Window=SNew(SWindow).Title(FText::FromString(TEXT("CubeShot layout verification"))).ClientSize(FVector2D(1280,720)).SupportsMaximize(false).SupportsMinimize(false)[Panel.ToSharedRef()];
@@ -114,7 +217,7 @@ namespace
                 Panel->SelectJobForAutomation(SelectedJobId);
                 Test->TestEqual(TEXT("Diagnostic selection leaves normal job result formatting unchanged"),Panel->ResultsForAutomation().ToString(),OriginalResults.ToString());
                 // Close the observer, reconstruct the real panel and verify results survive reopening.
-                Panel->Shutdown();Panel=SNew(SCubeShotPanel);Panel->AddTargetForAutomation(TEXT("/Engine/BasicShapes/Cube.Cube"));Window->SetContent(Panel.ToSharedRef());
+                Panel->Shutdown();if(!Workspace)Workspace=MakeShared<FCubeShotWorkspaceController>();Panel=SNew(SCubeShotPanel).Workspace(Workspace);Panel->AddTargetForAutomation(TEXT("/Engine/BasicShapes/Cube.Cube"));Window->SetContent(Panel.ToSharedRef());
                 Test->TestEqual(TEXT("Result text survives tab reopening"),Panel->ResultsForAutomation().ToString(),OriginalResults.ToString());
                 Test->TestEqual(TEXT("Historical selection survives tab reopening"),Panel->SelectedJobForAutomation(),SelectedJobId);
                 Window->Resize(FVector2D(1920,1080));Deadline=FPlatformTime::Seconds()+8;Phase=2;return false;
@@ -135,7 +238,7 @@ bool FCubeShotMultiSelectionTest::RunTest(const FString&)
 {
     FString Project=FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());Project.ReplaceInline(TEXT("\\"),TEXT("/"));
     if(!Project.Contains(TEXT("/Saved/UnrealTools/V12/Projects/"))){AddWarning(TEXT("UI model mutation regression is restricted to owned QA projects."));return true;}
-    auto Panel=SNew(SCubeShotPanel);const auto BeforePaths=Panel->TargetPathsForAutomation();Panel->ClearTargetsForAutomation();
+    auto Workspace=MakeShared<FCubeShotWorkspaceController>();auto Panel=SNew(SCubeShotPanel).Workspace(Workspace);const auto BeforePaths=Panel->TargetPathsForAutomation();Panel->ClearTargetsForAutomation();
     const FString Cube=TEXT("/Engine/BasicShapes/Cube.Cube"),Sphere=TEXT("/Engine/BasicShapes/Sphere.Sphere"),Cone=TEXT("/Engine/BasicShapes/Cone.Cone"),Cylinder=TEXT("/Engine/BasicShapes/Cylinder.Cylinder");
     for(const FString& Path:{Cube,Sphere,Cone,Cylinder})Panel->AddTargetForAutomation(Path);Panel->AddTargetForAutomation(Cube);
     TestEqual(TEXT("Multiple targets deduplicate"),Panel->TargetPathsForAutomation().Num(),4);
@@ -175,7 +278,7 @@ bool FCubeShotMultiSelectionTest::RunTest(const FString&)
     auto Delete=MakeShared<FJsonObject>();Delete->SetStringField(TEXT("action"),TEXT("delete"));Delete->SetStringField(TEXT("id"),ProfileId);
     const auto Deleted=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_profiles"))->Run(Delete);const TSharedPtr<FJsonObject>* Content;
     TestTrue(TEXT("MCP deletes remembered profile"),Deleted.JsonObject->TryGetObjectField(TEXT("structuredContent"),Content)&&UnrealToolsRuntime::GetBool(*Content,TEXT("success")));
-    Panel->Shutdown();Panel=SNew(SCubeShotPanel);TestEqual(TEXT("Deleted persisted profile falls back on reopening"),Panel->ProfileForAutomation(),FString(TEXT("editor_default")));
+    Panel->Shutdown();Panel=SNew(SCubeShotPanel).Workspace(Workspace);TestEqual(TEXT("Deleted persisted profile falls back on reopening"),Panel->ProfileForAutomation(),FString(TEXT("editor_default")));
     Panel->ClearTargetsForAutomation();for(const FString& Path:BeforePaths)Panel->AddTargetForAutomation(Path);Panel->Shutdown();return true;
 }
 #endif

@@ -21,3 +21,20 @@ Unreal Engine 프로젝트에서 재사용하는 Editor 플러그인을 보관�
 GUI와 MCP는 같은 서비스와 작업 큐를 호출합니다. GUI는 선택·편집·확인·결과 표시를, MCP는 JSON/schema·스레드 전환·응답 포장을 담당합니다. GUI의 미리보기는 transient 출력용 별도 경로이며 저장 작업의 예약·기록을 생성하지 않습니다.
 
 공통 원본을 수정한 뒤 `python Scripts/sync_runtime.py`를 실행합니다. 각 플러그인 내부 동기화 사본을 직접 수정하지 않습니다. `--check`로 drift를 확인하며 원본 헤더 누락은 오류입니다. `--python-only`는 C++ 동기화를 명시적으로 생략합니다. 플러그인 하나를 복사해도 저장소 상위 폴더 없이 빌드·설치할 수 있습니다.
+
+## Editor workspace
+
+두 도구는 행별 독립 옵션과 모듈 소유 workspace를 사용합니다. 기본 옵션 변경은 새 대상에만 반영하며, 기존 행은 명시적인 편집·프리셋·일괄 적용·초기화로 변경합니다. GUI는 확정한 행별 옵션 snapshot으로 기존 작업 서비스를 호출하고 MCP API와 저장 형식은 유지합니다.
+
+`Shared/Native/UnrealToolsWorkspace.h`는 Unreal 없이 컴파일하는 상태 코어이며 `UnrealToolsWorkspaceController.h`는 JSON·프리셋·이력 서비스 어댑터입니다. 각 플러그인 controller와 Slate 표시 코드는 분리되어 있습니다. 공통 코드는 기존 동기화 명령으로 배포합니다.
+
+`UnrealToolsServiceInstance.h`의 세대 번호로 작업 서비스의 인스턴스 수명을 구분합니다. 같은 주소와 revision으로 서비스가 재생성돼도 이전 결과 캐시나 pin 식별자를 재사용하지 않습니다. 세대 할당기는 Unreal 없이 컴파일·검사하며, 실제 controller의 캐시·pin 재연결은 별도 UE 회귀 테스트 대상입니다.
+
+```sh
+python3 Scripts/sync_runtime.py --check
+python3 Scripts/test_workspace.py
+python3 -m unittest discover -s MCP/tests -q
+python3 -m unittest discover -s Unreal_CubeShot/MCP/tests -q
+```
+
+[workspace 검증 기록과 Unreal 후속 확인](MCP/WORKSPACE_VALIDATION.md)을 참고하세요.

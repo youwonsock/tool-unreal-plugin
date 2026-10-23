@@ -139,7 +139,7 @@ bool FCubeShotInteractiveCheckoutTest::RunTest(const FString&)
     auto Request=Fixture.Request();const auto Interactive=CubeShot::Service::InspectBatch(Request,true),Strict=CubeShot::Service::InspectBatch(Request);
     TestTrue(TEXT("Interactive inspection reports required checkout"),UnrealToolsRuntime::GetBool(Interactive,TEXT("requires_checkout")));
     TestFalse(TEXT("Unattended inspection does not permit read-only output"),UnrealToolsRuntime::GetBool(Strict,TEXT("can_proceed")));
-    auto Panel=SNew(SCubeShotPanel);Panel->ClearTargetsForAutomation();Panel->AddTargetForAutomation(Fixture.Mesh->GetPathName());
+    auto Panel=SNew(SCubeShotPanel).Workspace(MakeShared<FCubeShotWorkspaceController>());Panel->ClearTargetsForAutomation();Panel->AddTargetForAutomation(Fixture.Mesh->GetPathName());
     const int32 Before=CubeShot::Service::Jobs().GetJobs().Num();int32 Dialogs=0;
     Panel->SetSubmissionDecisionsForAutomation([](){return true;},[&](const TArray<UPackage*>&,FText&){++Dialogs;return false;});Panel->StartBatchForAutomation();
     TestEqual(TEXT("Cancelled checkout refuses job admission"),CubeShot::Service::Jobs().GetJobs().Num(),Before);TestEqual(TEXT("Checkout happens before admission"),Dialogs,1);
@@ -154,7 +154,7 @@ bool FCubeShotWarningsObserverTest::RunTest(const FString&)
 {
     if(!OwnedProject(*this))return true;FOwnedFixture Fixture;if(!TestTrue(TEXT("Owned source fixture"),Fixture.Initialize()))return false;
     Fixture.Mesh->GetNaniteSettings().bEnabled=true;auto Material=NewObject<UMaterial>(Fixture.Package,TEXT("M_Warning"),RF_Public|RF_Standalone);Material->BlendMode=BLEND_Translucent;Fixture.ExtraAssets.Add(Material);Fixture.Mesh->SetMaterial(0,Material);
-    auto Panel=SNew(SCubeShotPanel);Panel->ClearTargetsForAutomation();Panel->AddTargetForAutomation(Fixture.Mesh->GetPathName());Panel->SetResolutionForAutomation(257);
+    auto Panel=SNew(SCubeShotPanel).Workspace(MakeShared<FCubeShotWorkspaceController>());Panel->ClearTargetsForAutomation();Panel->AddTargetForAutomation(Fixture.Mesh->GetPathName());Panel->SetResolutionForAutomation(257);
     const FString Status=Panel->StatusForAutomation().ToString();TestTrue(TEXT("Options area displays Nanite limitation"),Status.Contains(TEXT("Nanite")));
     TestTrue(TEXT("Options area displays NPOT warning"),Status.Contains(TEXT("Non-power-of-two")));TestTrue(TEXT("Options area displays material warning"),Status.Contains(TEXT("Translucent")));
     Panel->RefreshHistoryForAutomation();const uint64 Before=Panel->HistoryReadsForAutomation();for(int32 Index=0;Index<100;++Index)Panel->ResultsForAutomation();

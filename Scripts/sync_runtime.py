@@ -34,7 +34,7 @@ def synchronize(root=REPOSITORY, *, check=False, include_native=True, mcp_source
         raise ValueError("No plugin MCP manifests found.")
     drift = []
     if include_native and (not native_root.is_dir() or any(not (native_root / name).is_file() for name in
-            ("UnrealToolsRuntime.h", "UnrealToolsRuntimeTests.inl"))):
+            ("UnrealToolsRuntime.h", "UnrealToolsRuntimeTests.inl", "UnrealToolsWorkspace.h", "UnrealToolsWorkspaceController.h", "UnrealToolsServiceInstance.h"))):
         raise ValueError(f"Missing canonical shared C++ runtime files: {native_root}; use --python-only to skip native sync")
     native = sorted(path for path in native_root.rglob("*") if managed(path) and path.suffix in {".h", ".inl"}) if include_native else []
     for directory, descriptor in targets:

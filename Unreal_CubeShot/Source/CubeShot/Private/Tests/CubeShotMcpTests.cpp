@@ -1,3 +1,4 @@
+#include "CubeShotWorkspaceController.h"
 #include "IModelContextProtocolModule.h"
 #include "IModelContextProtocolTool.h"
 #include "Misc/AutomationTest.h"
@@ -60,7 +61,7 @@ bool FCubeShotMcpContractTest::RunTest(const FString& Parameters)
 namespace
 {
     struct FRegistryRegressionState
-    {TAtomic<bool> CallbackDone{false};TAtomic<bool> RegistrationReset{false};TSharedPtr<FJsonObject> Reply;bool NewStatusSuccess=false;};
+    {TAtomic<bool> CallbackDone{false};TAtomic<bool> RegistrationReset{false};TSharedPtr<FJsonObject> Reply;bool NewStatusSuccess=false;bool WorkspaceSurvived=false;TSharedPtr<FCubeShotWorkspaceController> Workspace;};
     class FCubeShotRegistrationGenerationCommand final : public IAutomationLatentCommand
     {
         FAutomationTestBase* Test;TSharedRef<FRegistryRegressionState> State=MakeShared<FRegistryRegressionState>();bool Started=false;double Deadline=0;
@@ -72,6 +73,7 @@ namespace
             {
                 FString Project=FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());Project.ReplaceInline(TEXT("\\"),TEXT("/"));
                 if(!Project.Contains(TEXT("/Saved/UnrealTools/V12/Projects/"))||CubeShot::Service::Jobs().IsBusy()){Test->AddWarning(TEXT("Registry lifecycle regression requires idle owned QA project."));return true;}
+                State->Workspace=MakeShared<FCubeShotWorkspaceController>();State->Workspace->Add(TEXT("/Engine/BasicShapes/Cube.Cube"));
                 auto OldTool=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_status"));Started=true;Deadline=FPlatformTime::Seconds()+10;
                 // Both tasks are posted from one producer to the same normal-priority game-thread queue.
                 // Reset registration runs before the old tool's operation; no game-thread waits/ticks.
@@ -80,6 +82,7 @@ namespace
                     AsyncTask(ENamedThreads::GameThread,[State]()
                     {
                         CubeShot::Mcp::Unregister();CubeShot::Mcp::Register();
+                        State->Workspace->ReconcileProfiles();State->Workspace->RefreshHistory(true);State->WorkspaceSurvived=State->Workspace->BuildRequest().IsValid();
                         auto NewTool=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_status"));auto Result=NewTool->Run(MakeShared<FJsonObject>());
                         const TSharedPtr<FJsonObject>* Content;State->NewStatusSuccess=Result.JsonObject->TryGetObjectField(TEXT("structuredContent"),Content)&&UnrealToolsRuntime::GetBool(*Content,TEXT("success"));State->RegistrationReset.Store(true);
                     });
@@ -89,6 +92,7 @@ namespace
             }
             if(!State->CallbackDone.Load()){if(FPlatformTime::Seconds()<Deadline)return false;Test->AddError(TEXT("Posted stale MCP callback did not complete."));return true;}
             Test->TestTrue(TEXT("Registration reset ran first"),State->RegistrationReset.Load());Test->TestTrue(TEXT("New registration works"),State->NewStatusSuccess);
+            Test->TestTrue(TEXT("Session workspace reconnects to recreated services"),State->WorkspaceSurvived);
             Test->TestFalse(TEXT("Old posted tool rejected after unregister/register"),UnrealToolsRuntime::GetBool(State->Reply,TEXT("success")));
             Test->TestEqual(TEXT("Stale callback returns safe interruption"),UnrealToolsRuntime::GetString(State->Reply,TEXT("error_code")),FString(TEXT("EDITOR_INTERRUPTED")));return true;
         }
