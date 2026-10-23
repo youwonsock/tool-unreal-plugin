@@ -6,6 +6,15 @@ from support import REPO, ProjectCase
 
 
 class NativeContractTests(ProjectCase):
+    def test_shared_automation_registry_expectations_cover_all_declared_cases(self):
+        source = (REPO / "Shared/Native/UnrealToolsRuntimeTests.inl").read_text("utf-8")
+        declared = re.findall(r'^UNREAL_TOOLS_RUNTIME_IMPLEMENT\((\w+),', source, re.MULTILINE)
+        expected = re.findall(r'TEXT\("(Runtime\w+Test)"\)', source)
+        count = re.search(r'all shared cases are registered"\), Count, (\d+)\)', source)
+        self.assertIsNotNone(count)
+        self.assertEqual(len(declared), int(count.group(1)))
+        self.assertCountEqual(expected, declared)
+
     def test_registered_tool_sets_match_each_deployed_manifest(self):
         for directory, module, expected in [("Unreal_CubeShot", "CubeShot", 8),
                                             ("Unreal_FBX_Exporter", "FBX_Exporter", 7)]:

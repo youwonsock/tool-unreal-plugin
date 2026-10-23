@@ -307,6 +307,29 @@ public:
         Profile->SetBoolField(TEXT("builtin"), true);
         Builtins.Add(Id, Profile);
     }
+    bool UserFileExists(const FString& Id) const
+    {
+        return ProfileIdValid(Id) && !Builtins.Contains(Id) && IFileManager::Get().FileExists(*(Root / (Id + TEXT(".json"))));
+    }
+    bool ValidateUserProfile(const FObject& Profile, FString& Message) const
+    {
+        if (!CheckFields(Profile, {TEXT("schema_version"), TEXT("provider_id"), TEXT("id"), TEXT("display_name"), TEXT("options")}, Message)) return false;
+        const FString Id = GetString(Profile, TEXT("id"));
+        if (!Profile->HasTypedField<EJson::String>(TEXT("id")) || !ProfileIdValid(Id) || Builtins.Contains(Id))
+        { Message = TEXT("A user profile needs a valid non-built-in id."); return false; }
+        if (!Profile->HasTypedField<EJson::Number>(TEXT("schema_version")) || GetNumber(Profile, TEXT("schema_version")) != 1 ||
+            !Profile->HasTypedField<EJson::String>(TEXT("provider_id")) || GetString(Profile, TEXT("provider_id")) != Provider ||
+            !Profile->HasTypedField<EJson::String>(TEXT("display_name")) || GetString(Profile, TEXT("display_name")).TrimStartAndEnd().IsEmpty())
+        { Message = TEXT("Profile needs schema_version=1, matching provider_id and a non-blank display_name."); return false; }
+        if (!Profile->HasTypedField<EJson::Object>(TEXT("options")))
+        { Message = TEXT("Profile options must be an object without overwrite approval."); return false; }
+        FObject Options = Clone(GetObject(Profile, TEXT("options")));
+        if (Options->HasField(TEXT("overwrite")))
+        { Message = TEXT("Profile options must be an object without overwrite approval."); return false; }
+        if (Validator && !Validator(Options, Message)) return false;
+        Profile->SetObjectField(TEXT("options"), Clone(Options));
+        return true;
+    }
     FObject Get(const FString& Id) const
     {
         if (const FObject* Found = Builtins.Find(Id)) return Clone(*Found);
@@ -314,14 +337,8 @@ public:
         FString Text;
         if (!FFileHelper::LoadFileToString(Text, *(Root / (Id + TEXT(".json"))))) return nullptr;
         FObject Profile = Parse(Text);
-        if (!Profile.IsValid() || GetString(Profile, TEXT("id")) != Id ||
-            GetString(Profile, TEXT("provider_id")) != Provider || GetNumber(Profile, TEXT("schema_version")) != 1 ||
-            !Profile->HasTypedField<EJson::String>(TEXT("display_name")) || GetString(Profile, TEXT("display_name")).TrimStartAndEnd().IsEmpty()) return nullptr;
-        FObject Options = Clone(GetObject(Profile, TEXT("options")));
-        if (!Profile->HasTypedField<EJson::Object>(TEXT("options")) || Options->HasField(TEXT("overwrite"))) return nullptr;
         FString Message;
-        if (Validator && !Validator(Options, Message)) return nullptr;
-        Profile->SetObjectField(TEXT("options"), Clone(Options));
+        if (GetString(Profile, TEXT("id")) != Id || !ValidateUserProfile(Profile, Message)) return nullptr;
         Profile->SetBoolField(TEXT("builtin"), false);
         return Profile;
     }
@@ -375,19 +392,14 @@ public:
         }
         if (Action != TEXT("save")) return Error(TEXT("action must be list, get, save or delete."));
         FObject Profile = Clone(GetObject(Args, TEXT("profile")));
-        if (!CheckFields(Profile, {TEXT("schema_version"), TEXT("provider_id"), TEXT("id"), TEXT("display_name"), TEXT("options")}, Message)) return Error(Message);
+        if (!ValidateUserProfile(Profile, Message)) return Error(Message);
         const FString Id = GetString(Profile, TEXT("id"));
-        if (!ProfileIdValid(Id) || Builtins.Contains(Id)) return Error(TEXT("A user profile needs a valid non-built-in id."));
-        if (GetNumber(Profile, TEXT("schema_version")) != 1 || GetString(Profile, TEXT("provider_id")) != Provider || GetString(Profile, TEXT("display_name")).IsEmpty())
-            return Error(TEXT("Profile needs schema_version=1, matching provider_id and display_name."));
-        FObject Options = GetObject(Profile, TEXT("options"));
-        if (!Options.IsValid() || Options->HasField(TEXT("overwrite"))) return Error(TEXT("Profile options must be an object without overwrite approval."));
-        if (Validator && !Validator(Options, Message)) return Error(Message);
-        Profile->SetObjectField(TEXT("options"), Clone(Options));
         if (Args->HasField(TEXT("overwrite")) && !Args->HasTypedField<EJson::Boolean>(TEXT("overwrite"))) return Error(TEXT("overwrite must be boolean."));
-        if (Get(Id).IsValid() && !GetBool(Args, TEXT("overwrite"))) return Error(TEXT("Profile exists; explicit overwrite is required."), TEXT("OUTPUT_CONFLICT"));
+        if (UserFileExists(Id) && !GetBool(Args, TEXT("overwrite"))) return Error(TEXT("Profile exists; explicit overwrite is required."), TEXT("OUTPUT_CONFLICT"));
         if (!AtomicJson(Root / (Id + TEXT(".json")), Profile, Message)) return Error(Message, TEXT("IO_ERROR"));
-        FObject Reply = Ok(); Reply->SetObjectField(TEXT("profile"), Get(Id)); return Reply;
+        const FObject Stored = Get(Id);
+        if (!Stored) return Error(TEXT("Saved profile could not be read and validated."), TEXT("IO_ERROR"));
+        FObject Reply = Ok(); Reply->SetObjectField(TEXT("profile"), Stored); return Reply;
     }
 private:
     FString Provider, Root;

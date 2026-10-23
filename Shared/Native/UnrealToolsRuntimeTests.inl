@@ -202,8 +202,8 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeSchemaTest)::RunTest(const FString&)
         if (!FModuleManager::Get().IsModuleLoaded(*Provider.Key)) continue;
         const FString PrettyPrefix = Provider.Key + TEXT(".Editor.Runtime."); int32 Count = 0;
         for (const auto& Info : Registered) if (Info.GetFullTestPath().StartsWith(PrettyPrefix)) ++Count;
-        TestEqual(PrettyPrefix + TEXT("all shared cases are registered"), Count, 16);
-        for (const TCHAR* Suffix : {TEXT("RuntimeShutdownOrderTest"), TEXT("RuntimeAdmissionTest"), TEXT("RuntimeSchemaTest"), TEXT("RuntimeProfileTest"), TEXT("RuntimeIdempotencyTest"), TEXT("RuntimeFailureCancelTest"), TEXT("RuntimeRecoveryTest"), TEXT("RuntimeControlDurabilityTest"), TEXT("RuntimeWaitingCheckpointTest"), TEXT("RuntimeTerminalWriteTest"), TEXT("RuntimeDiagnosticRetryTest"), TEXT("RuntimeHistoryRetentionTest"), TEXT("RuntimePrepareAndInvalidSchemaTest"), TEXT("RuntimeRepairedGuardTest"), TEXT("RuntimeMaintenanceRevalidationTest"), TEXT("RuntimeFrameSchedulerTest")})
+        TestEqual(PrettyPrefix + TEXT("all shared cases are registered"), Count, 18);
+        for (const TCHAR* Suffix : {TEXT("RuntimeShutdownOrderTest"), TEXT("RuntimeAdmissionTest"), TEXT("RuntimeSchemaTest"), TEXT("RuntimeProfileTest"), TEXT("RuntimeIdempotencyTest"), TEXT("RuntimeFailureCancelTest"), TEXT("RuntimeRecoveryTest"), TEXT("RuntimeControlDurabilityTest"), TEXT("RuntimeWaitingCheckpointTest"), TEXT("RuntimeTerminalWriteTest"), TEXT("RuntimeDiagnosticRetryTest"), TEXT("RuntimeHistoryRetentionTest"), TEXT("RuntimePrepareAndInvalidSchemaTest"), TEXT("RuntimeRepairedGuardTest"), TEXT("RuntimeMaintenanceRevalidationTest"), TEXT("RuntimeFrameSchedulerTest"), TEXT("RuntimeWorkspaceHistoryCacheTest"), TEXT("RuntimeWorkspaceServiceGenerationTest")})
         {
             const FString ClassName = Provider.Value + Suffix;
             TestTrue(TEXT("Provider-specific engine registry key: ") + ClassName, Framework.ContainsTest(ClassName));
@@ -238,8 +238,7 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeProfileTest)::RunTest(const FString&)
     const FObject Typed = Parse(TEXT(R"({"schema_version":1,"provider_id":"runtime_test","id":"typed_read","display_name":"Typed read","options":{"fail":false}})"));
     auto ReadProbe = [&](const FObject& Candidate, bool Expected, const FString& Label)
     {
-        // Each read-validation example is independent. Repeated atomic replacement
-        // of one file is already covered by the explicit overwrite tests above.
+        // Each read/write validation example has its own file and expected bytes.
         const FString ProbeId = TEXT("typed_read_") + FGuid::NewGuid().ToString(EGuidFormats::Digits).ToLower();
         const FString TypedFile = Fixture.Root / TEXT("Profiles") / (ProbeId + TEXT(".json"));
         const FObject Probe = Clone(Candidate); Probe->SetStringField(TEXT("id"), ProbeId);
@@ -259,6 +258,23 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeProfileTest)::RunTest(const FString&)
             GetBool(ReadResult, TEXT("success")) && GetObject(ReadResult, TEXT("profile")).IsValid(), Expected);
         TestTrue(Label + TEXT(" fixture read after validation: ") + TypedFile, FFileHelper::LoadFileToString(After, *TypedFile));
         TestEqual(Label + TEXT(" read preserves stored bytes"), After, Before);
+        FObject WriteRequest = MakeShared<FJsonObject>();
+        WriteRequest->SetStringField(TEXT("action"), TEXT("save"));
+        WriteRequest->SetObjectField(TEXT("profile"), Clone(Probe));
+        WriteRequest->SetBoolField(TEXT("overwrite"), true);
+        const auto WriteResult = Fixture.Profiles.Handle(WriteRequest);
+        TestEqual(Label + TEXT(" save uses the same validation as read"), GetBool(WriteResult, TEXT("success")), Expected);
+        if (Expected)
+        {
+            const auto Stored = GetObject(WriteResult, TEXT("profile"));
+            TestTrue(Label + TEXT(" success always returns readable options"), GetObject(Stored, TEXT("options")).IsValid());
+            TestEqual(Label + TEXT(" preserves the accepted display name"), GetString(Stored, TEXT("display_name")), GetString(Probe, TEXT("display_name")));
+        }
+        else
+        {
+            TestTrue(Label + TEXT(" invalid save leaves a readable original file"), FFileHelper::LoadFileToString(After, *TypedFile));
+            TestEqual(Label + TEXT(" invalid save preserves original bytes"), After, Before);
+        }
     };
     ReadProbe(Typed, true, TEXT("Valid user profile"));
     FObject Invalid = Clone(Typed); Invalid->SetStringField(TEXT("options"), TEXT("not an object")); ReadProbe(Invalid, false, TEXT("Malformed options metadata"));
@@ -266,6 +282,56 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeProfileTest)::RunTest(const FString&)
     Invalid = Clone(Typed); GetObject(Invalid, TEXT("options"))->SetNumberField(TEXT("fail"), 3); ReadProbe(Invalid, false, TEXT("Invalid provider option type"));
     Invalid = Clone(Typed); GetObject(Invalid, TEXT("options"))->SetBoolField(TEXT("overwrite"), true); ReadProbe(Invalid, false, TEXT("Stored overwrite approval"));
     Invalid = Clone(Typed); Invalid->SetNumberField(TEXT("schema_version"), 2); ReadProbe(Invalid, false, TEXT("Unsupported profile version"));
+    Invalid = Clone(Typed); Invalid->SetStringField(TEXT("schema_version"), TEXT("1")); ReadProbe(Invalid, false, TEXT("Version must be a number"));
+    Invalid = Clone(Typed); Invalid->SetStringField(TEXT("display_name"), TEXT("")); ReadProbe(Invalid, false, TEXT("Empty name"));
+    Invalid = Clone(Typed); Invalid->SetStringField(TEXT("display_name"), TEXT(" \t\r\n ")); ReadProbe(Invalid, false, TEXT("Whitespace-only name"));
+    Invalid = Clone(Typed); Invalid->SetStringField(TEXT("display_name"), TEXT("  Named profile  ")); ReadProbe(Invalid, true, TEXT("Non-blank padded name"));
+    Invalid = Clone(Typed); Invalid->SetStringField(TEXT("provider_id"), TEXT("other")); ReadProbe(Invalid, false, TEXT("Wrong provider"));
+    Invalid = Clone(Typed); Invalid->SetBoolField(TEXT("unknown"), true); ReadProbe(Invalid, false, TEXT("Unknown profile field"));
+    for (int32 Variant = 0; Variant < 3; ++Variant)
+    {
+        const auto Id = TEXT("damaged_") + FGuid::NewGuid().ToString(EGuidFormats::Digits).ToLower();
+        const auto Filename = Fixture.Root / TEXT("Profiles") / (Id + TEXT(".json"));
+        auto Profile = Clone(Typed); Profile->SetStringField(TEXT("id"), Id);
+        auto Damaged = Clone(Profile);
+        if (Variant == 1) Damaged->SetNumberField(TEXT("schema_version"), 2);
+        if (Variant == 2) GetObject(Damaged, TEXT("options"))->SetStringField(TEXT("fail"), TEXT("invalid"));
+        const FString Original = Variant == 0 ? TEXT("{malformed JSON") : JsonText(Damaged);
+        if (!TestTrue(TEXT("Damaged profile fixture written"), FFileHelper::SaveStringToFile(Original, *Filename))) return false;
+        TestFalse(TEXT("Damaged profile cannot be loaded"), Fixture.Profiles.Get(Id).IsValid());
+        TestTrue(TEXT("Unreadable profiles still occupy their user file"), Fixture.Profiles.UserFileExists(Id));
+        auto Repair = MakeShared<FJsonObject>(); Repair->SetStringField(TEXT("action"), TEXT("save")); Repair->SetObjectField(TEXT("profile"), Profile);
+        TestEqual(TEXT("Missing approval cannot replace a damaged profile"), GetString(Fixture.Profiles.Handle(Repair), TEXT("error_code")), FString(TEXT("OUTPUT_CONFLICT")));
+        Repair->SetBoolField(TEXT("overwrite"), false);
+        TestEqual(TEXT("False approval cannot replace a damaged profile"), GetString(Fixture.Profiles.Handle(Repair), TEXT("error_code")), FString(TEXT("OUTPUT_CONFLICT")));
+        Repair->SetStringField(TEXT("overwrite"), TEXT("true"));
+        TestFalse(TEXT("Approval must be a boolean"), GetBool(Fixture.Profiles.Handle(Repair), TEXT("success")));
+        FString Retained; TestTrue(TEXT("Refused replacement preserves the file"), FFileHelper::LoadFileToString(Retained, *Filename));
+        TestEqual(TEXT("Refused replacement preserves damaged bytes"), Retained, Original);
+        Repair->SetBoolField(TEXT("overwrite"), true);
+        TestTrue(TEXT("Explicit approval can repair a damaged profile"), GetBool(Fixture.Profiles.Handle(Repair), TEXT("success")));
+        TestTrue(TEXT("Repaired profile is readable"), Fixture.Profiles.Get(Id).IsValid());
+    }
+    auto Model = MakeShared<UnrealToolsWorkspace::FController>(
+        Fixture.Defaults, TEXT("default"), [](FObject&, FString&) { return true; },
+        [&]() -> FProfileStore& { return Fixture.Profiles; }, [&]() -> FJobService& { return *Fixture.Jobs; });
+    Model->Add(TEXT("/Game/ProfileRow.ProfileRow")); Model->Edit(TEXT("/Game/ProfileRow.ProfileRow"));
+    Model->Patch(Model->Token(), Parse(TEXT("{\"fail\":true}")));
+    const auto EditedOptions = JsonText(Model->CopyActiveOptions());
+    Model->SetProfileName(TEXT(" \t\r\n "));
+    bool bPrompted = false;
+    TestFalse(TEXT("Both provider controllers reject blank profile names"), GetBool(Model->SaveActiveProfile(TEXT("blank_name"), [&]() { bPrompted = true; return true; }), TEXT("success")));
+    TestFalse(TEXT("Invalid metadata never requests confirmation"), bPrompted);
+    TestFalse(TEXT("Invalid metadata never creates a profile file"), Fixture.Profiles.UserFileExists(TEXT("blank_name")));
+    TestEqual(TEXT("Failed profile save preserves non-default options"), JsonText(Model->CopyActiveOptions()), EditedOptions);
+    TestEqual(TEXT("Failed profile save preserves the editing scope's identity"), Model->ProfileId(), FString(TEXT("default")));
+    Model->Shutdown();
+    int32 Validations = 0;
+    Fixture.Profiles.SetValidator([&](FObject&, FString& Message) { Message = TEXT("Injected read failure"); return ++Validations == 1; });
+    Replaced->SetBoolField(TEXT("overwrite"), true);
+    const auto Unreadable = Fixture.Profiles.Handle(Replaced);
+    TestEqual(TEXT("A failed post-save read is an IO error, never a successful null profile"), GetString(Unreadable, TEXT("error_code")), FString(TEXT("IO_ERROR")));
+    TestFalse(TEXT("Failed read does not return options to apply"), GetObject(Unreadable, TEXT("profile")).IsValid());
     return true;
 }
 

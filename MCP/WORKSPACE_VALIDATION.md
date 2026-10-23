@@ -132,3 +132,30 @@ Editor에서 남은 검사: 두 플러그인 빌드, 8개/7개 실제 등록과 
 - 수정 전 새 설정 테스트가 실패하는 것을 확인했습니다. 수정 후 공통 Python **87개**와 CubeShot 독립 설치 smoke **1개**가 통과했습니다. MCP 전송은 모의 세션이며 실제 Editor 연결 결과가 아닙니다.
 - 독립 C++ 상태 코어 25개·서비스 세대 9개는 원본과 두 배포본 각각 통과했고 Slate 소유권 정적 검사 2개도 통과했습니다. `python3 Scripts/sync_runtime.py --check`와 `git diff --check`를 통과했으며, 두 배포본의 설정 감지 코드가 원본과 일치합니다.
 - 이번 수정은 Python 설정 감지에 한정합니다. Editor 빌드·Native Automation·실제 MCP 등록/호출·Slate·캐시/pin 수명·GPU·Texture2D/PNG/FBX·UAT 검증은 계속 미실행입니다.
+
+### 프리셋 검증·손상 파일 보호·FBX 복구 표시 캐시 수정 — 2026-10-24
+
+- 공통 `FProfileStore::ValidateUserProfile`로 읽기·저장·controller의 저장/가져오기 검증을 통일했습니다. 현재 schema/version/provider/ID 타입과 옵션을 검사하고 공백뿐인 표시 이름을 거부합니다. 정상 이름의 앞뒤 공백은 보존합니다. 저장 후 재조회 실패는 `IO_ERROR`로 반환하며 controller도 누락된 반환 옵션을 빈 기본 옵션으로 적용하지 않습니다.
+- 덮어쓰기 판정은 프리셋 파싱 성공 여부 대신 실제 사용자 파일 존재 여부를 사용합니다. 손상 JSON·미지원 schema·잘못된 옵션의 파일도 GUI 저장/가져오기 확인과 MCP의 명시적인 boolean `overwrite=true`가 필요합니다. 유효하지 않은 새 입력은 확인창 전에 거부하며, 승인 중 편집 범위가 바뀌면 저장하지 않는 기존 보호도 유지합니다.
+- 공통 이력 캐시에 외부 표시 상태 확인 콜백을 추가했습니다. FBX controller는 journal 존재 여부와 캐시의 누락 표시를 비교합니다. 삭제·복원 시 service/job revision이 같아도 새 서비스 snapshot으로 표시를 재생성하므로 누락 경고가 추가·제거됩니다. 상태 불변 시 JSON 재조회·직렬화를 하지 않으며, 다른 캐시 항목으로 전환할 때도 확인합니다. 서비스 세대 구분·최대 20개 결과·pin 수명은 유지합니다. 파일 내용의 유효성은 기존 복구 진단 서비스가 담당합니다.
+
+작성·확장한 Unreal 회귀 검사 (**미실행**):
+
+- 두 플러그인의 `Editor.Runtime.Profiles`: 읽기와 저장의 동일 판정, 빈 이름/공백 이름/정상 이름 보존, 잘못된 타입·provider·알 수 없는 필드 거부, 잘못된 입력의 원문 보존, 손상/미지원/옵션 오류 파일의 승인 없거나 false일 때 거부 및 true일 때 복구, 저장 후 읽기 실패의 오류 응답, 공통 controller에서 실패한 저장의 옵션·편집 범위 보존.
+- `FBX_Exporter.Editor.Workspace.ProfileOperations`: 실제 FBX 옵션으로 공백 이름 저장 거부, 손상·미지원 파일에 대한 저장과 가져오기 양쪽 확인창·거절·승인, 확인 중 편집 범위 변경 거부, 옵션 및 기존 파일 바이트 보존.
+- `FBX_Exporter.Editor.Workspace.RecoveryFileCache`: 임시 파일과 별도 `FJobService`·가짜 runner에 실제 FBX 표시 함수를 연결합니다. 파일 삭제·복원, service/job revision 불변, 경고와 복사 JSON 갱신, 원래 runner 경고·이전 snapshot 보존, 상태 불변 시 결과 재사용, 캐시된 다른 작업 재선택, 기록 비변경·pin 해제를 검사합니다. 실제 추출을 수행하는 테스트는 아닙니다.
+- 기존 공통 Automation 등록 검사에 누락된 이력 캐시·서비스 세대 두 케이스를 포함해 기대 개수를 16에서 실제 18로 수정했습니다. 새 Python 정적 계약 검사가 기존 기대값에서 `18 != 16`으로 실패한 뒤 수정 후 통과했습니다.
+
+현재 변경분에서 Unreal 없이 실행한 검사:
+
+| 검사 | 결과 |
+|---|---|
+| `python3 Scripts/test_workspace.py` | 원본·두 배포본 각각 상태 코어 25개 + 서비스 세대 9개 통과, Slate 소유권 정적 검사 2개 통과 |
+| 테스트 venv의 `python -m unittest discover -s MCP/tests -q` | 88개 통과 |
+| 테스트 venv의 `python -m unittest discover -s Unreal_CubeShot/MCP/tests -q` | 독립 설치 smoke 1개 통과 |
+| `python3 Scripts/sync_runtime.py --check` | provider 2개, MCP 파일 7개씩·native 파일 5개씩 일치 |
+| `git diff --check` | 통과 |
+
+변경한 원본/FBX C++ 소스 7개는 UE 매크로를 임시 치환한 Tree-sitter 구문 비교에서 기존 대비 새 진단이 없었습니다. 최초 파서 0.26.0 실행은 비정상 종료했으며 임시 검증 환경의 0.25.2로 다시 비교했습니다. 이 보조 검사는 Unreal 타입 검사나 컴파일 결과가 아닙니다. 독립 C++ 테스트도 이번에 바꾼 UE 프리셋 I/O·controller 캐시를 실행하지 않으므로 위 동작은 소스 검토와 미실행 회귀 테스트의 범위입니다.
+
+Editor 후속 검증: Win64 Editor 빌드와 위 Automation 및 기존 `WorkspaceHistoryCache`·`WorkspaceServiceGeneration`을 실행해야 합니다. 두 GUI에서 정상/공백 이름 저장, 손상 파일 교체 취소·승인과 MCP의 승인 없는 거부를 확인하고, FBX 복구 journal 삭제·복원 후 열린 이력의 경고·복사 JSON·탭 재개방·pin 수명을 확인해야 합니다. 기존 Slate·GPU·Texture2D/PNG/FBX 출력·UAT 검증도 계속 미실행입니다. API 버전·요청 schema·프리셋 및 작업 기록 저장 형식은 변경하지 않았습니다.

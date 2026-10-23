@@ -33,6 +33,7 @@ namespace FBXExporter
 	bool AcknowledgeJobRecovery(const UnrealToolsRuntime::FObject& Job, FString& OutError);
 	bool ValidateRecoveryJournal(const UnrealToolsRuntime::FObject& Data, FString& OutError);
 	void AnnotateRecoveryStatus(const UnrealToolsRuntime::FObject& Job);
+	bool IsRecoveryStatusCurrent(const UnrealToolsRuntime::FObject& Job);
 	void RegisterRecoveryDiagnostics();
 	bool AdvanceRecoveryDiagnostics(int32 Budget = 8);
 	void CancelRecoveryDiagnostics();

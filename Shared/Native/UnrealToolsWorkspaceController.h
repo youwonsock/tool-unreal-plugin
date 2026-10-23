@@ -490,9 +490,12 @@ public:
         if (GetBool(Result, TEXT("success")))
         {
             const auto Profile = GetObject(Result, TEXT("profile"));
+            const auto Options = GetObject(Profile, TEXT("options"));
+            if (!Options || GetString(Profile, TEXT("id")) != Id)
+                return FailOperation(TEXT("Saved profile response has no matching options."), TEXT("IO_ERROR"));
             // The saved request and its source were frozen before a modal prompt.
             // Bind the returned values to that scope, never reread the UI.
-            Replace(Source, Clone(GetObject(Profile, TEXT("options"))), Id, false);
+            Replace(Source, Clone(Options), Id, false);
         }
         return Result;
     }
@@ -702,7 +705,8 @@ public:
             HistoryServiceGeneration = InstanceGeneration;
             LastHistoryRevision = MAX_uint64;
         }
-        if (!Force && LastHistoryRevision == Revision && PresentedJobId == HistoryData.JobId)
+        if (!Force && LastHistoryRevision == Revision && PresentedJobId == HistoryData.JobId &&
+            (!DisplayedResult || !IsAnnotationCurrent || IsAnnotationCurrent(DisplayedResult->Selected)))
             return;
         const bool RefreshSummaries = Force || LastHistoryRevision != Revision;
         LastHistoryRevision = Revision;
@@ -740,6 +744,9 @@ public:
         }
     }
     TFunction<void(const FObject&)> Annotate;
+    // Providers can cheaply check external dependencies without rereading or
+    // serializing a job. A stale annotation rebuilds a fresh service snapshot.
+    TFunction<bool(const FObject&)> IsAnnotationCurrent;
     static FString FormatResult(const FObject& Job)
     {
         if (!Job)
@@ -829,7 +836,8 @@ private:
             return nullptr;
         const auto Revision = Service.GetJobRevision(Id);
         const auto* Existing = ResultCache.Find(Id);
-        if (!Force && Existing && (*Existing)->Revision == Revision)
+        if (!Force && Existing && (*Existing)->Revision == Revision &&
+            (!IsAnnotationCurrent || IsAnnotationCurrent((*Existing)->Selected)))
         {
             ResultOrder.Remove(Id);
             ResultOrder.Add(Id);
@@ -890,15 +898,10 @@ private:
         TGuardValue<bool> Guard(bChangingProfile, true);
         Request = Clone(Request);
         const auto Profile = GetObject(Request, TEXT("profile"));
-        auto Options = Clone(GetObject(Profile, TEXT("options")));
         FString Message;
-        if (!GetObject(Profile, TEXT("options")))
-            return FailOperation(TEXT("Profile JSON requires options."));
-        if (!Normalize(Options, Message))
+        if (!Profiles().ValidateUserProfile(Profile, Message))
             return FailOperation(Message);
-        Profile->SetObjectField(TEXT("options"), Options);
-        const auto Existing = GetProfile(GetString(Profile, TEXT("id")));
-        if (Existing && !GetBool(Existing, TEXT("builtin")))
+        if (Profiles().UserFileExists(GetString(Profile, TEXT("id"))))
         {
             if (!Confirm || !Confirm())
                 return nullptr;

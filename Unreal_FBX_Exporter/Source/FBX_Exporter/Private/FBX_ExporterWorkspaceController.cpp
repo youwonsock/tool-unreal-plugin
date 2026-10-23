@@ -25,6 +25,7 @@ FFBXExporterWorkspaceController::FFBXExporterWorkspaceController(bool ReadSettin
     if (!RecoveryRefresh)
         RecoveryRefresh = &FBXExporter::RefreshRecoveryDiagnostics;
     Annotate = &FBXExporter::AnnotateRecoveryStatus;
+    IsAnnotationCurrent = &FBXExporter::IsRecoveryStatusCurrent;
     SetProfileName(TEXT("My FBX Profile"));
     SetUserProfileId(TEXT("my_fbx_profile"));
 }

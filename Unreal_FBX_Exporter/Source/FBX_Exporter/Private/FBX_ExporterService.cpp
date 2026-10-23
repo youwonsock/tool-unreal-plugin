@@ -1644,6 +1644,19 @@ bool ValidateRecoveryJournal(const UnrealToolsRuntime::FObject& Data, FString& O
 	return true;
 }
 
+bool IsRecoveryStatusCurrent(const UnrealToolsRuntime::FObject& Job)
+{
+	using namespace UnrealToolsRuntime;
+	for (const auto& Item : GetArray(Job, TEXT("items")))
+	{
+		const auto Result = GetObject(Item->AsObject(), TEXT("result"));
+		const FString Journal = GetString(Result, TEXT("recovery_journal"));
+		if (!Journal.IsEmpty() && (!Result->HasTypedField<EJson::Boolean>(TEXT("recovery_journal_missing")) ||
+			GetBool(Result, TEXT("recovery_journal_missing")) != !IFileManager::Get().FileExists(*Journal))) return false;
+	}
+	return true;
+}
+
 void AnnotateRecoveryStatus(const UnrealToolsRuntime::FObject& Job)
 {
 	using namespace UnrealToolsRuntime;

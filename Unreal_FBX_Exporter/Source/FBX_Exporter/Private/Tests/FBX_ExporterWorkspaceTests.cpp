@@ -1,8 +1,118 @@
 #include "FBX_ExporterWorkspaceController.h"
+#include "FBX_ExporterService.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/ScopeExit.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
+namespace
+{
+class FRecoveryHistoryRunner final : public UnrealToolsRuntime::IItemRunner
+{
+public:
+    explicit FRecoveryHistoryRunner(const FString& Journal)
+    {
+        using namespace UnrealToolsRuntime;
+        Result = UnrealToolsRuntime::Error(TEXT("Fixture requires recovery."), TEXT("RECOVERY_REQUIRED"));
+        Result->SetBoolField(TEXT("recovery_required"), true);
+        Result->SetStringField(TEXT("recovery_journal"), Journal);
+        Result->SetArrayField(TEXT("warnings"), Strings({TEXT("Keep the original runner warning.")}));
+    }
+    UnrealToolsRuntime::EStepResult Step(bool, bool) override { return UnrealToolsRuntime::EStepResult::Failed; }
+    FString GetStage() const override { return TEXT("done"); }
+    bool CanCancel() const override { return true; }
+    bool IsCommitPhase() const override { return false; }
+    UnrealToolsRuntime::FObject GetResult() const override { return Result; }
+    uint64 GetSnapshotRevision() const override { return 0; }
+private:
+    UnrealToolsRuntime::FObject Result;
+};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFBXWorkspaceRecoveryCacheTest, "FBX_Exporter.Editor.Workspace.RecoveryFileCache",
+                                 EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FFBXWorkspaceRecoveryCacheTest::RunTest(const FString&)
+{
+    using namespace UnrealToolsRuntime;
+    const FString Name = TEXT("UnrealToolsTests/RecoveryHistory/") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    const FString Root = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / Name);
+    ON_SCOPE_EXIT { IFileManager::Get().DeleteDirectory(*Root, false, true); };
+    IFileManager::Get().MakeDirectory(*Root, true);
+    const FString JournalA = Root / TEXT("a.json"), JournalB = Root / TEXT("b.json");
+    const FString MeshA = TEXT("/Game/CacheA.CacheA"), MeshB = TEXT("/Game/CacheB.CacheB");
+    if (!TestTrue(TEXT("Two recovery file fixtures prepared"),
+                  FFileHelper::SaveStringToFile(TEXT("{}"), *JournalA) && FFileHelper::SaveStringToFile(TEXT("{}"), *JournalB))) return false;
+    FProfileStore Profiles(TEXT("recovery_cache_test"), Name);
+    const auto Defaults = MakeShared<FJsonObject>();
+    FJobService Jobs(TEXT("recovery_cache_test"), Name, Profiles, Defaults,
+        [](FObject&, FString&) { return true; },
+        [&](const FItemSpec& Spec) { return TArray<FString>{Root / FPackageName::GetShortName(Spec.MeshPath)}; },
+        [&](const FItemSpec& Spec, const FString&) -> TUniquePtr<IItemRunner> {
+            return MakeUnique<FRecoveryHistoryRunner>(Spec.MeshPath == MeshA ? JournalA : JournalB);
+        });
+    const auto Submit = [&](const FString& Mesh) {
+        auto Request = MakeShared<FJsonObject>();
+        Request->SetStringField(TEXT("request_id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+        Request->SetArrayField(TEXT("mesh_paths"), Strings({Mesh}));
+        return GetString(Jobs.Start(Request), TEXT("job_id"));
+    };
+    const auto A = Submit(MeshA), B = Submit(MeshB);
+    if (!TestTrue(TEXT("Both fake jobs admitted"), !A.IsEmpty() && !B.IsEmpty())) return false;
+    Jobs.AdvanceOneStepForTesting(); Jobs.AdvanceOneStepForTesting();
+    auto Model = MakeShared<UnrealToolsWorkspace::FController>(Defaults, TEXT("fixture"),
+        [](FObject&, FString&) { return true; }, [&]() -> FProfileStore& { return Profiles; }, [&]() -> FJobService& { return Jobs; });
+    Model->Annotate = &FBXExporter::AnnotateRecoveryStatus;
+    Model->IsAnnotationCurrent = &FBXExporter::IsRecoveryStatusCurrent;
+    Model->AttachView(); Model->SelectJob(A);
+    const auto ItemResult = [](const FObject& Job) { return GetObject(GetArray(Job, TEXT("items"))[0]->AsObject(), TEXT("result")); };
+    if (!TestTrue(TEXT("Fake job exposes a recovery result"), GetBool(Model->History().Selected, TEXT("recovery_required")))) return false;
+    const auto Original = Model->History().Selected;
+    const auto ServiceRevision = Jobs.GetRevision(), JobRevision = Jobs.GetJobRevision(A);
+    auto Reads = Model->History().ResultReads;
+    const auto DisplayRevision = Model->History().ResultRevision;
+    TestFalse(TEXT("Existing journal is annotated as present"), GetBool(ItemResult(Original), TEXT("recovery_journal_missing")));
+    for (int32 Index = 0; Index < 5; ++Index) Model->RefreshHistory();
+    TestEqual(TEXT("Unchanged files do not reread the selected job"), Model->History().ResultReads, Reads);
+    TestEqual(TEXT("Unchanged files do not recreate display text"), Model->History().ResultRevision, DisplayRevision);
+    if (!TestTrue(TEXT("Delete only the external recovery file"), IFileManager::Get().Delete(*JournalA))) return false;
+    Model->RefreshHistory();
+    TestEqual(TEXT("File deletion refreshes the selected result without force"), Model->History().ResultReads, Reads + 1);
+    const auto Missing = Model->History().Selected;
+    TestTrue(TEXT("Deleted journal updates the missing flag"), GetBool(ItemResult(Missing), TEXT("recovery_journal_missing")));
+    TestEqual(TEXT("Missing annotation adds one warning to the runner warning"), GetArray(ItemResult(Missing), TEXT("warnings")).Num(), 2);
+    TestTrue(TEXT("Both formatted text and copied JSON contain the new warning"),
+             Model->History().Body.Contains(TEXT("Recorded recovery journal is missing")) &&
+             Model->History().Json.Contains(TEXT("Recorded recovery journal is missing")));
+    TestFalse(TEXT("Refreshing does not mutate the prior snapshot"), GetBool(ItemResult(Original), TEXT("recovery_journal_missing")));
+    TestEqual(TEXT("External invalidation keeps exactly one selected pin"), Jobs.GetJobPinCountForTesting(A), 1);
+    Reads = Model->History().ResultReads;
+    Model->RefreshHistory();
+    TestEqual(TEXT("An unchanged missing file is cached too"), Model->History().ResultReads, Reads);
+    if (!TestTrue(TEXT("Restore the journal"), FFileHelper::SaveStringToFile(TEXT("{}"), *JournalA))) return false;
+    Model->RefreshHistory();
+    TestEqual(TEXT("Restoration refreshes the result once"), Model->History().ResultReads, Reads + 1);
+    TestFalse(TEXT("Restoration clears the missing flag"), GetBool(ItemResult(Model->History().Selected), TEXT("recovery_journal_missing")));
+    TestEqual(TEXT("Restoration removes only the transient warning"), GetArray(ItemResult(Model->History().Selected), TEXT("warnings")).Num(), 1);
+    TestTrue(TEXT("Restoration retains the runner warning"), Model->History().Body.Contains(TEXT("Keep the original runner warning.")));
+    TestFalse(TEXT("Restoration clears the transient warning from displayed JSON"), Model->History().Json.Contains(TEXT("Recorded recovery journal is missing")));
+    TestTrue(TEXT("Restoration does not mutate the detached missing snapshot"), GetBool(ItemResult(Missing), TEXT("recovery_journal_missing")));
+    Model->SelectJob(B);
+    Reads = Model->History().ResultReads;
+    if (!TestTrue(TEXT("Change an unselected cached job's file"), IFileManager::Get().Delete(*JournalA))) return false;
+    Model->RefreshHistory();
+    TestEqual(TEXT("Unselected file changes do not reread the displayed job"), Model->History().ResultReads, Reads);
+    Model->SelectJob(A);
+    TestEqual(TEXT("Selecting an old cache entry rechecks its external dependency"), Model->History().ResultReads, Reads + 1);
+    TestTrue(TEXT("Reselected cached job has the current missing flag"), GetBool(ItemResult(Model->History().Selected), TEXT("recovery_journal_missing")));
+    TestEqual(TEXT("File changes do not change the service revision"), Jobs.GetRevision(), ServiceRevision);
+    TestEqual(TEXT("File changes do not change the job revision"), Jobs.GetJobRevision(A), JobRevision);
+    auto Selector = MakeShared<FJsonObject>(); Selector->SetStringField(TEXT("job_id"), A);
+    TestFalse(TEXT("Annotations never enter service-owned records"), ItemResult(Jobs.Status(Selector))->HasField(TEXT("recovery_journal_missing")));
+    Model->DetachView();
+    TestEqual(TEXT("Detach releases the selected pin after external refresh"), Jobs.GetJobPinCountForTesting(A), 0);
+    Model->Shutdown();
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FFBXWorkspaceRecoveryCommandTest, "FBX_Exporter.Editor.Workspace.RecoveryCommand",
                                  EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FFBXWorkspaceRecoveryCommandTest::RunTest(const FString&)
@@ -147,6 +257,17 @@ bool FFBXWorkspaceProfileFlowTest::RunTest(const FString&)
     auto Patch = MakeShared<FJsonObject>();
     Patch->SetNumberField(TEXT("resolution"), 512);
     Model->Patch(Model->Token(), Patch);
+    const auto Edited = JsonText(Model->CopyOptions(A));
+    const auto SelectedProfile = Model->ProfileId();
+    Model->SetProfileName(TEXT(" \t\r\n "));
+    const auto BeforeInvalid = Confirmations;
+    TestFalse(TEXT("Whitespace-only names are rejected before asking for replacement"),
+              GetBool(Model->SaveProfile(Decline), TEXT("success")));
+    TestEqual(TEXT("Invalid names do not prompt"), Confirmations, BeforeInvalid);
+    TestEqual(TEXT("Invalid saves preserve current row options"), JsonText(Model->CopyOptions(A)), Edited);
+    TestEqual(TEXT("Invalid saves preserve the selected profile"), Model->ProfileId(), SelectedProfile);
+    TestEqual(TEXT("Invalid saves preserve stored options"), JsonText(GetObject(Model->GetProfile(Id), TEXT("options"))), Saved);
+    Model->SetProfileName(TEXT("Workspace regression fixture"));
     TestFalse(TEXT("Replacement can be cancelled"), Model->SaveProfile(Decline).IsValid());
     TestEqual(TEXT("Cancellation retains the stored profile"),
               JsonText(GetObject(Model->GetProfile(Id), TEXT("options"))), Saved);
@@ -177,6 +298,30 @@ bool FFBXWorkspaceProfileFlowTest::RunTest(const FString&)
              Model->ProfileId() == TEXT("pbr") && JsonText(Model->CopyOptions(A)) == Kept);
     TestFalse(TEXT("Malformed imported options are rejected"),
               GetBool(Model->ImportProfileText(TEXT("{\"options\":{\"resolution\":1}}"), Decline), TEXT("success")));
+    // Both GUI entry points must ask even when the existing file cannot load.
+    for (int32 Variant = 0; Variant < 2; ++Variant)
+    {
+        auto Unsupported = Clone(Profile); Unsupported->SetNumberField(TEXT("schema_version"), 2);
+        const FString Original = Variant == 0 ? TEXT("{damaged profile") : JsonText(Unsupported);
+        if (!TestTrue(TEXT("Unreadable GUI profile fixture written"), FFileHelper::SaveStringToFile(Original, *ProfileFile))) return false;
+        const auto BeforeDecline = Confirmations;
+        TestFalse(TEXT("Damaged-file save can be declined"), Model->SaveProfile(Decline).IsValid());
+        TestFalse(TEXT("Damaged-file import can be declined"), Model->ImportProfileText(Exported, Decline).IsValid());
+        TestEqual(TEXT("Save and import both prompt for damaged files"), Confirmations, BeforeDecline + 2);
+        FString Retained; TestTrue(TEXT("Declined damaged file is retained"), FFileHelper::LoadFileToString(Retained, *ProfileFile));
+        TestEqual(TEXT("Declined save/import preserve damaged bytes"), Retained, Original);
+        TestEqual(TEXT("Declined save/import preserve workspace options"), JsonText(Model->CopyOptions(A)), Kept);
+        Result = Model->SaveProfile([&]() { Model->Edit(B); return true; });
+        TestFalse(TEXT("Damaged-file approval also rejects a stale scope"), GetBool(Result, TEXT("success")));
+        TestTrue(TEXT("Stale confirmation leaves the file readable as raw text"), FFileHelper::LoadFileToString(Retained, *ProfileFile));
+        TestEqual(TEXT("Stale confirmation preserves damaged bytes"), Retained, Original);
+        Model->Edit(A);
+        Result = Variant == 0 ? Model->SaveProfile([]() { return true; })
+                              : Model->ImportProfileText(Exported, []() { return true; });
+        TestTrue(TEXT("Explicit GUI approval repairs the profile"), GetBool(Result, TEXT("success")));
+        TestTrue(TEXT("Repaired GUI profile can be loaded"), Model->GetProfile(Id).IsValid());
+        TestEqual(TEXT("Repair preserves workspace options"), JsonText(Model->CopyOptions(A)), Kept);
+    }
     return true;
 }
 
