@@ -26,6 +26,7 @@ public:
     void Shutdown() override { if (ShutdownObserver) ShutdownObserver(); }
     EStepResult Step(bool bCancel, bool) override
     {
+        ++SnapshotRevision;
         if (bCancel && CanCancel()) { Result = UnrealToolsRuntime::Error(TEXT("Cancelled before commit."), TEXT("CANCELLED")); return EStepResult::Cancelled; }
         if (GetBool(Spec.Options, TEXT("fail")) && Phase == 1)
         { Result = UnrealToolsRuntime::Error(TEXT("Injected stage failure."), TEXT("TEST_FAILURE")); return EStepResult::Failed; }
@@ -37,10 +38,12 @@ public:
     bool CanCancel() const override { return Phase < 2; }
     bool IsCommitPhase() const override { return Phase == 2; }
     FObject GetResult() const override { return Result; }
+    uint64 GetSnapshotRevision() const override { return SnapshotRevision; }
 private:
     FItemSpec Spec;
     FObject Result;
     int32 Phase = 0;
+    uint64 SnapshotRevision = 0;
 };
 class FRuntimeWaitingRunner final : public IItemRunner
 {
@@ -360,7 +363,6 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeControlDurabilityTest)::RunTest(const FSt
     FString Text; FFileHelper::LoadFileToString(Text, *(Fixture.Root / TEXT("Jobs") / (Id + TEXT(".json"))));
     TestFalse(TEXT("Failed control does not change disk cancellation"), GetBool(Parse(Text), TEXT("cancel_requested")));
     FItemSpec Spec; Spec.MeshPath = TEXT("/Game/A.A"); Spec.Options = Fixture.Defaults;
-    TestEqual(TEXT("Structured async submission retains BUSY"), GetString(Fixture.Jobs->StartLegacyStructured(Spec, [](FObject) {}), TEXT("error_code")), FString(TEXT("BUSY")));
     Fixture.Jobs->SetPersistGateForTesting(nullptr);
     TestTrue(TEXT("Same cancel retry succeeds"), GetBool(Fixture.Jobs->Control(Cancel), TEXT("success")));
     Fixture.Jobs->AdvanceOneStepForTesting();
@@ -439,7 +441,7 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeFrameSchedulerTest)::RunTest(const FStrin
     using namespace UnrealToolsRuntime;
     FRuntimeFixture Fixture; Fixture.Jobs.Reset();
     FTSTicker StreamingTicker;
-    int32 Steps = 0, StreamingPumps = 0, Completions = 0;
+    int32 Steps = 0, StreamingPumps = 0;
     bool bInCoreTickerCallback = false, bInStreamingTicker = false, bUnsafeStep = false;
     StreamingTicker.AddTicker(FTickerDelegate::CreateLambda([&](float)
     {
@@ -461,11 +463,9 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeFrameSchedulerTest)::RunTest(const FStrin
             return Runner;
         });
     TestTrue(TEXT("Frame driver owns a removable EndFrame delegate"), FCoreDelegates::OnEndFrame.IsBoundToObject(Fixture.Jobs.Get()));
-    FItemSpec Spec; Spec.MeshPath = TEXT("/Game/FrameDriver.FrameDriver"); Spec.Options = Fixture.Defaults;
-    const FObject Accepted = Fixture.Jobs->StartLegacyStructured(Spec, [&](FObject Result)
-    { ++Completions; TestTrue(TEXT("Scheduled legacy completion retains native success"), GetBool(Result, TEXT("success"))); });
+    const FObject Accepted = Fixture.Jobs->Start(Fixture.Input({TEXT("/Game/FrameDriver.FrameDriver")}));
     const FString Id = GetString(Accepted, TEXT("job_id"));
-    TestTrue(TEXT("Legacy async admission is still busy before execution"), Fixture.Jobs->IsBusy());
+    TestTrue(TEXT("Queued admission is still busy before execution"), Fixture.Jobs->IsBusy());
     TestEqual(TEXT("Retained request replay remains available while the frame is pending"), GetString(Fixture.Jobs->Start(Clone(GetObject(Accepted, TEXT("request")))), TEXT("job_id")), Id);
     for (int32 Index = 0; Index < 5; ++Index)
     {
@@ -482,22 +482,21 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeFrameSchedulerTest)::RunTest(const FStrin
     }
     TestFalse(TEXT("Runner execution never occurs within the simulated Core/streaming ticker callback"), bUnsafeStep);
     TestEqual(TEXT("Streaming wait safely pumps a separate ticker for every step"), StreamingPumps, 3);
-    TestEqual(TEXT("Frame-driven legacy job succeeds"), GetString(Fixture.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("state")), FString(TEXT("succeeded")));
-    TestEqual(TEXT("Frame-driven async completion is delivered exactly once"), Completions, 1);
-    Fixture.Jobs->AdvanceFrameForTesting(); TestEqual(TEXT("Idle frame cannot repeat completion"), Completions, 1);
-    const FObject Cancelled = Fixture.Jobs->StartLegacyStructured(Spec, [&](FObject) { ++Completions; });
+    TestEqual(TEXT("Frame-driven job succeeds"), GetString(Fixture.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("state")), FString(TEXT("succeeded")));
+    const auto CompletedRevision = Fixture.Jobs->GetJobRevision(Id);
+    Fixture.Jobs->AdvanceFrameForTesting();
+    TestEqual(TEXT("Idle frames do not rewrite completed jobs"), Fixture.Jobs->GetJobRevision(Id), CompletedRevision);
+    const FObject Cancelled = Fixture.Jobs->Start(Fixture.Input());
     const FString CancelledId = GetString(Cancelled, TEXT("job_id"));
     FObject Cancel = FRuntimeFixture::ById(CancelledId); Cancel->SetStringField(TEXT("action"), TEXT("cancel"));
     TestTrue(TEXT("Queued cancellation persists before its execution frame"), GetBool(Fixture.Jobs->Control(Cancel), TEXT("success")));
     Fixture.Jobs->AdvanceFrameForTesting();
     TestEqual(TEXT("Frame driver respects queued cancellation"), GetString(Fixture.Jobs->Status(FRuntimeFixture::ById(CancelledId)), TEXT("state")), FString(TEXT("cancelled")));
     TestEqual(TEXT("Cancelled-before-start job performs no runner step"), Steps, 3);
-    TestEqual(TEXT("Cancellation callback is also delivered once"), Completions, 2);
     Fixture.Jobs->Shutdown();
     TestFalse(TEXT("Shutdown removes the EndFrame delegate before releasing runner resources"), FCoreDelegates::OnEndFrame.IsBoundToObject(Fixture.Jobs.Get()));
     Fixture.Jobs->AdvanceFrameForTesting(); Fixture.Jobs->AdvanceMaintenanceTickerForTesting();
     TestEqual(TEXT("Stopped scheduler cannot step a runner"), Steps, 3);
-    TestEqual(TEXT("Stopped scheduler cannot repeat callbacks"), Completions, 2);
     return true;
 }
 
@@ -506,20 +505,21 @@ UNREAL_TOOLS_RUNTIME_IMPLEMENT(RuntimeTerminalWriteTest, UNREAL_TOOLS_TEST_PREFI
 bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeTerminalWriteTest)::RunTest(const FString&)
 {
     using namespace UnrealToolsRuntime;
-    FRuntimeFixture Fixture; FObject Completed; int32 CompletionCount = 0;
+    FRuntimeFixture Fixture;
     Fixture.Jobs->SetPersistGateForTesting([](const FObject& Job, FString& Message)
     { if (GetString(Job, TEXT("state")) == TEXT("succeeded")) { Message = TEXT("Injected terminal write failure."); return false; } return true; });
     FItemSpec Spec; Spec.MeshPath = TEXT("/Engine/BasicShapes/Cube.Cube"); Spec.Options = Fixture.Defaults;
-    FObject Accepted = Fixture.Jobs->StartLegacyStructured(Spec, [&](FObject Result) { ++CompletionCount; Completed = Result; }); const FString Id = GetString(Accepted, TEXT("job_id"));
+    FObject Accepted = Fixture.Jobs->Start(Fixture.Input()); const FString Id = GetString(Accepted, TEXT("job_id"));
     for (int32 Index = 0; Index < 3; ++Index) Fixture.Jobs->AdvanceOneStepForTesting();
     const FObject Job = Fixture.Jobs->Status(FRuntimeFixture::ById(Id));
     TestEqual(TEXT("Journal failure uses existing failed terminal state"), GetString(Job, TEXT("state")), FString(TEXT("failed")));
     TestTrue(TEXT("Failure holds recovery reservation"), GetBool(Job, TEXT("recovery_required")));
-    TestFalse(TEXT("Legacy completion cannot report native success"), GetBool(Completed, TEXT("success")));
-    TestEqual(TEXT("Legacy completion retains IO_ERROR"), GetString(Completed, TEXT("error_code")), FString(TEXT("IO_ERROR")));
-    TestEqual(TEXT("Native output paths survive error overlay"), GetArray(Completed, TEXT("saved")).Num(), 1);
+    TestEqual(TEXT("Journal failure retains IO_ERROR"), GetString(Job, TEXT("error_code")), FString(TEXT("IO_ERROR")));
+    const auto NativeResult = GetObject(GetArray(Job, TEXT("items"))[0]->AsObject(), TEXT("result"));
+    TestEqual(TEXT("Native output paths survive persistence failure"), GetArray(NativeResult, TEXT("saved")).Num(), 1);
+    const auto FailedRevision = Fixture.Jobs->GetJobRevision(Id);
     for (int32 Index = 0; Index < 5; ++Index) Fixture.Jobs->AdvanceOneStepForTesting();
-    TestEqual(TEXT("Terminal write failure completes its callback exactly once"), CompletionCount, 1);
+    TestEqual(TEXT("Terminal failure is not executed twice"), Fixture.Jobs->GetJobRevision(Id), FailedRevision);
     TestEqual(TEXT("Same outputs remain blocked"), GetString(Fixture.Jobs->Start(Fixture.Input()), TEXT("error_code")), FString(TEXT("OUTPUT_CONFLICT")));
     Fixture.Jobs.Reset(); Fixture.Create();
     TestTrue(TEXT("Persisted failure reservation survives restart"), GetBool(Fixture.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("recovery_required")));
@@ -743,35 +743,27 @@ bool UNREAL_TOOLS_RUNTIME_CLASS(RuntimeHistoryRetentionTest)::RunTest(const FStr
         }
     }
     {
-        FRuntimeFixture Legacy;
-        FObject Record = Legacy.Jobs->Start(Legacy.Input()); const FString Id = GetString(Record, TEXT("job_id")); Legacy.Jobs.Reset();
-        Record->SetStringField(TEXT("state"), TEXT("succeeded")); Record->RemoveField(TEXT("finished_at"));
-        Record->SetStringField(TEXT("created_at"), (FDateTime::UtcNow() - FTimespan::FromDays(9)).ToIso8601());
-        Record->SetNumberField(TEXT("current_index"), 1); GetObject(Record, TEXT("progress"))->SetNumberField(TEXT("completed"), 1);
-        FObject Item = GetArray(Record, TEXT("items"))[0]->AsObject(); Item->SetStringField(TEXT("state"), TEXT("succeeded")); Item->SetObjectField(TEXT("result"), Ok());
-        const FString Filename = Legacy.Root / TEXT("Jobs") / (Id + TEXT(".json")); FString Message;
-        const bool bWritten = AtomicJson(Filename, Record, Message); TestTrue(TEXT("Legacy timestamp fixture: ") + Message, bWritten); if (!bWritten) return false;
-        const FDateTime Intended = FDateTime::UtcNow() - FTimespan::FromDays(8); IFileManager::Get().SetTimeStamp(*Filename, Intended);
-        const FDateTime OriginalTime = IFileManager::Get().GetTimeStamp(*Filename);
-        TestTrue(TEXT("Legacy fixture has the intended old file time"), FMath::Abs((OriginalTime - Intended).GetTotalSeconds()) < 2.0);
-        FObject Untrusted = Clone(Record), Request = Clone(GetObject(Record, TEXT("request")));
-        const FString UntrustedId = TEXT("runtime_test-") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
-        const FString UntrustedRequestId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower); Request->SetStringField(TEXT("request_id"), UntrustedRequestId);
-        Untrusted->SetStringField(TEXT("job_id"), UntrustedId); Untrusted->SetStringField(TEXT("request_id"), UntrustedRequestId);
-        Untrusted->SetObjectField(TEXT("request"), Request); Untrusted->SetStringField(TEXT("request_hash"), RequestHash(Request));
-        const FString UntrustedFile = Legacy.Root / TEXT("Jobs") / (UntrustedId + TEXT(".json"));
-        const bool bUntrustedWritten = AtomicJson(UntrustedFile, Untrusted, Message); TestTrue(TEXT("Untrusted timestamp fixture: ") + Message, bUntrustedWritten); if (!bUntrustedWritten) return false;
-        IFileManager::Get().SetTimeStamp(*UntrustedFile, FDateTime::UtcNow() + FTimespan::FromDays(2));
-        Legacy.Create(); const FObject Loaded = Legacy.Jobs->Status(FRuntimeFixture::ById(Id));
-        TestEqual(TEXT("Legacy finished time uses the original file mtime captured before rewriting"), GetString(Loaded, TEXT("finished_at")), OriginalTime.ToIso8601());
-        TestEqual(TEXT("Legacy finished time records its provenance"), GetString(Loaded, TEXT("finished_at_source")), FString(TEXT("legacy_file_mtime")));
-        TestTrue(TEXT("Migration rewrites metadata after retaining the original timestamp"), IFileManager::Get().GetTimeStamp(*Filename) > OriginalTime);
-        TestTrue(TEXT("Untrustworthy legacy file time is excluded from cleanup"), GetBool(Legacy.Jobs->Status(FRuntimeFixture::ById(UntrustedId)), TEXT("retention_time_untrusted")));
-        Legacy.Jobs.Reset(); Legacy.Create();
-        TestEqual(TEXT("A second startup does not replace the migrated finished time"), GetString(Legacy.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("finished_at")), OriginalTime.ToIso8601());
-        Legacy.Jobs->RunMaintenanceForTesting();
-        TestEqual(TEXT("Migrated old completion expires according to its original timestamp"), GetString(Legacy.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("error_code")), FString(TEXT("NOT_FOUND")));
-        TestTrue(TEXT("Untrusted timestamp remains protected after restart and maintenance"), IFileManager::Get().FileExists(*UntrustedFile));
+        FRuntimeFixture Unsupported;
+        FObject Record = Unsupported.Jobs->Start(Unsupported.Input());
+        const FString Id = GetString(Record, TEXT("job_id"));
+        Unsupported.Jobs.Reset();
+        Record->SetStringField(TEXT("state"), TEXT("succeeded"));
+        Record->RemoveField(TEXT("finished_at"));
+        Record->SetNumberField(TEXT("current_index"), 1);
+        GetObject(Record, TEXT("progress"))->SetNumberField(TEXT("completed"), 1);
+        auto Item = GetArray(Record, TEXT("items"))[0]->AsObject();
+        Item->SetStringField(TEXT("state"), TEXT("succeeded"));
+        Item->SetObjectField(TEXT("result"), Ok());
+        const FString Filename = Unsupported.Root / TEXT("Jobs") / (Id + TEXT(".json"));
+        FString Message, Before, After;
+        if (!TestTrue(TEXT("Unsupported record fixture written"), AtomicJson(Filename, Record, Message))) return false;
+        FFileHelper::LoadFileToString(Before, *Filename);
+        Unsupported.Create();
+        TestFalse(TEXT("Missing completion timestamps are not upgraded into executable history"), GetBool(Unsupported.Jobs->Status(FRuntimeFixture::ById(Id)), TEXT("success")));
+        TestEqual(TEXT("Unsupported records become review diagnostics"), Unsupported.Jobs->GetRecordIssues().Num(), 1);
+        Unsupported.Jobs->RunMaintenanceForTesting();
+        TestTrue(TEXT("Unsupported source records are preserved for review"), FFileHelper::LoadFileToString(After, *Filename));
+        TestEqual(TEXT("No timestamp migration rewrites the original source"), After, Before);
     }
     return true;
 }

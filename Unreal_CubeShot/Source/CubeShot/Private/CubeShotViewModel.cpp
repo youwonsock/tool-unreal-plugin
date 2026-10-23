@@ -2,20 +2,9 @@
 
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
-#include "Materials/MaterialInterface.h"
-
-#define LOCTEXT_NAMESPACE "CubeShotViewModel"
 
 FCubeShotViewModel::FCubeShotViewModel()
 {
-	Options.BackgroundMode = ECubeShotBackgroundMode::Transparent;
-	Options.ProjectionMode = ECubeShotProjectionMode::Perspective;
-	Options.SolidColor = FLinearColor::FromSRGBColor(FColor(32, 32, 32));
-	Options.CameraDistance = 100.0;
-	Options.FieldOfView = 45.0;
-	Options.OrthoWidth = 100.0;
-	Options.Resolution = 1024;
-	Options.bAutoFit = true;
 	Validate();
 }
 
@@ -35,7 +24,7 @@ void FCubeShotViewModel::SetStaticMesh(UStaticMesh* InStaticMesh)
 	}
 	StaticMesh.Reset(InStaticMesh);
 	RefreshObjectPointers();
-	MarkChanged(EChangeKind::Recapture);
+	Validate();
 }
 
 void FCubeShotViewModel::SetBackgroundTexture(UTexture2D* InTexture)
@@ -47,14 +36,14 @@ void FCubeShotViewModel::SetBackgroundTexture(UTexture2D* InTexture)
 			&& CachedBackgroundTextureSourceId != InTexture->Source.GetId())
 		{
 			InvalidateBackgroundTextureSourceCache();
-			MarkChanged(EChangeKind::CompositeOnly);
+			Validate();
 		}
 		return;
 	}
 	BackgroundTexture.Reset(InTexture);
 	InvalidateBackgroundTextureSourceCache();
 	RefreshObjectPointers();
-	MarkChanged(EChangeKind::CompositeOnly);
+	Validate();
 }
 
 void FCubeShotViewModel::SetBackgroundMode(const ECubeShotBackgroundMode InMode)
@@ -62,7 +51,7 @@ void FCubeShotViewModel::SetBackgroundMode(const ECubeShotBackgroundMode InMode)
 	if (Options.BackgroundMode != InMode)
 	{
 		Options.BackgroundMode = InMode;
-		MarkChanged(EChangeKind::CompositeOnly);
+		Validate();
 	}
 }
 
@@ -71,7 +60,7 @@ void FCubeShotViewModel::SetSolidColor(const FLinearColor& InColor)
 	if (!Options.SolidColor.Equals(InColor))
 	{
 		Options.SolidColor = InColor;
-		MarkChanged(EChangeKind::CompositeOnly);
+		Validate();
 	}
 }
 
@@ -80,7 +69,7 @@ void FCubeShotViewModel::SetProjectionMode(const ECubeShotProjectionMode InMode)
 	if (Options.ProjectionMode != InMode)
 	{
 		Options.ProjectionMode = InMode;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -89,7 +78,7 @@ void FCubeShotViewModel::SetCameraDistance(const double InDistance)
 	if (!FMath::IsNearlyEqual(Options.CameraDistance, InDistance))
 	{
 		Options.CameraDistance = InDistance;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -98,7 +87,7 @@ void FCubeShotViewModel::SetFieldOfView(const double InFieldOfView)
 	if (!FMath::IsNearlyEqual(Options.FieldOfView, InFieldOfView))
 	{
 		Options.FieldOfView = InFieldOfView;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -107,7 +96,7 @@ void FCubeShotViewModel::SetOrthoWidth(const double InOrthoWidth)
 	if (!FMath::IsNearlyEqual(Options.OrthoWidth, InOrthoWidth))
 	{
 		Options.OrthoWidth = InOrthoWidth;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -116,7 +105,7 @@ void FCubeShotViewModel::SetResolution(const int32 InResolution)
 	if (Options.Resolution != InResolution)
 	{
 		Options.Resolution = InResolution;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -125,7 +114,7 @@ void FCubeShotViewModel::SetAutoFit(const bool bInAutoFit)
 	if (Options.bAutoFit != bInAutoFit)
 	{
 		Options.bAutoFit = bInAutoFit;
-		MarkChanged(EChangeKind::Recapture);
+		Validate();
 	}
 }
 
@@ -138,12 +127,7 @@ void FCubeShotViewModel::ApplyAutoFit(const FCubeShotAutoFitResult& Result)
 	}
 	Options.CameraDistance = Result.CameraDistance;
 	Options.OrthoWidth = Result.OrthoWidth;
-	MarkChanged(EChangeKind::Recapture);
-}
-
-void FCubeShotViewModel::RequestPreviewRecapture()
-{
-	MarkChanged(EChangeKind::Recapture);
+	Validate();
 }
 
 bool FCubeShotViewModel::Validate()
@@ -153,7 +137,7 @@ bool FCubeShotViewModel::Validate()
 	const bool bBackgroundTextureSourceValid = Options.BackgroundMode != ECubeShotBackgroundMode::Texture
 		|| !IsValid(Options.BackgroundTexture)
 		|| ValidateCachedBackgroundTextureSource(BackgroundTextureSourceError);
-	bOptionsValid = CubeShot::ValidateOptions(Options, ValidationError, ValidationWarning);
+	bool bOptionsValid = CubeShot::ValidateOptions(Options, ValidationError, ValidationWarning);
 	if (!bBackgroundTextureSourceValid)
 	{
 		bOptionsValid = false;
@@ -186,13 +170,6 @@ bool FCubeShotViewModel::IsCameraDistanceEnabled() const
 void FCubeShotViewModel::SetGenerating(const bool bInGenerating)
 {
 	bGenerating = bInGenerating;
-}
-
-void FCubeShotViewModel::MarkChanged(const EChangeKind ChangeKind)
-{
-	++Revision;
-	LastChangeKind = ChangeKind;
-	Validate();
 }
 
 void FCubeShotViewModel::RefreshObjectPointers()
@@ -236,5 +213,3 @@ void FCubeShotViewModel::InvalidateBackgroundTextureSourceCache()
 	bHasBackgroundTextureSourceResult = false;
 	bCachedBackgroundTextureSourceValid = false;
 }
-
-#undef LOCTEXT_NAMESPACE

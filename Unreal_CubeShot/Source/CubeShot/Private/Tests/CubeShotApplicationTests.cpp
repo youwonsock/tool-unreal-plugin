@@ -120,7 +120,7 @@ bool FCubeShotBatchApplicationParityTest::RunTest(const FString&)
     const auto Items=UnrealToolsRuntime::GetArray(Plan,TEXT("items"));TestEqual(TEXT("Full inspection retains every original row"),Items.Num(),3);
     if(Items.Num()==3)TestEqual(TEXT("A valid later target still receives six output paths"),UnrealToolsRuntime::GetArray(Items[2]->AsObject(),TEXT("outputs")).Num(),6);
     TestEqual(TEXT("Inspection preserves original request JSON"),UnrealToolsRuntime::JsonText(Input),Original);
-    auto Mcp=MakeShared<FJsonObject>();Mcp->SetArrayField(TEXT("mesh_paths"),Paths);Mcp->SetNumberField(TEXT("resolution"),257);
+    auto Mcp=MakeShared<FJsonObject>();Mcp->SetArrayField(TEXT("mesh_paths"),Paths);Mcp->SetObjectField(TEXT("options"),Options);
     const auto Reply=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_preflight"))->Run(Mcp);
     const auto McpPlan=UnrealToolsRuntime::GetObject(Reply.JsonObject,TEXT("structuredContent"));
     TestEqual(TEXT("GUI service and MCP adapter share ordered item plans"),UnrealToolsRuntime::GetArray(McpPlan,TEXT("items")).Num(),Items.Num());
@@ -201,17 +201,18 @@ namespace
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotFrozenQueuePngTest,"CubeShot.Editor.Application.FrozenQueuePngSource",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
 bool FCubeShotFrozenQueuePngTest::RunTest(const FString&){ADD_LATENT_AUTOMATION_COMMAND(FFrozenQueuePngCommand(this));return true;}
 
-IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotLegacyPngPolicyTest,"CubeShot.Editor.Application.LegacyPngOverwritePolicy",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
-bool FCubeShotLegacyPngPolicyTest::RunTest(const FString&)
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotPngOverwritePolicyTest,"CubeShot.Editor.Application.PngOverwritePolicy",EAutomationTestFlags::EditorContext|EAutomationTestFlags::EngineFilter)
+bool FCubeShotPngOverwritePolicyTest::RunTest(const FString&)
 {
     if(!OwnedProject(*this))return true;FOwnedFixture Fixture;if(!TestTrue(TEXT("Owned PNG source fixture"),Fixture.Initialize()))return false;FCubeShotGenerationResult Written;
     if(!TestTrue(TEXT("PNG output fixture"),Fixture.WriteFlat(Written)))return false;
     auto Args=MakeShared<FJsonObject>();Args->SetStringField(TEXT("texture_path"),Fixture.Outputs[0].GetObjectPath());auto First=CubeShot::Service::ExportPng(Args);
-    if(!TestTrue(TEXT("Legacy PNG call succeeds"),UnrealToolsRuntime::GetBool(First,TEXT("success"))))return false;
+    if(!TestTrue(TEXT("PNG creation succeeds"),UnrealToolsRuntime::GetBool(First,TEXT("success"))))return false;
     const FString Filename=UnrealToolsRuntime::GetString(First,TEXT("png_path"));TArray<uint8> Before,After;FFileHelper::LoadFileToArray(Before,*Filename);
-    TestTrue(TEXT("Omitted overwrite preserves legacy allowed policy"),UnrealToolsRuntime::GetBool(First,TEXT("overwrite_allowed")));
+    TestFalse(TEXT("Omitted overwrite protects existing output"),UnrealToolsRuntime::GetBool(First,TEXT("overwrite_allowed")));
     Args->SetBoolField(TEXT("overwrite"),false);TestFalse(TEXT("Explicit false protects existing output"),UnrealToolsRuntime::GetBool(CubeShot::Service::ExportPng(Args),TEXT("success")));FFileHelper::LoadFileToArray(After,*Filename);TestTrue(TEXT("Protected output bytes are unchanged"),Before==After);
-    Args->RemoveField(TEXT("overwrite"));auto Repeated=CubeShot::Service::ExportPng(Args);TestTrue(TEXT("Repeated legacy export succeeds"),UnrealToolsRuntime::GetBool(Repeated,TEXT("success")));
+    Args->RemoveField(TEXT("overwrite"));TestFalse(TEXT("Repeated PNG export requires explicit approval"),UnrealToolsRuntime::GetBool(CubeShot::Service::ExportPng(Args),TEXT("success")));
+    Args->SetBoolField(TEXT("overwrite"),true);auto Repeated=CubeShot::Service::ExportPng(Args);TestTrue(TEXT("Explicit PNG replacement succeeds"),UnrealToolsRuntime::GetBool(Repeated,TEXT("success")));
     TestTrue(TEXT("Existing file advisory is published"),UnrealToolsRuntime::GetBool(Repeated,TEXT("existing_file_observed")));return true;
 }
 
@@ -233,7 +234,7 @@ bool FCubeShotManualCameraParityTest::RunTest(const FString&)
         FCubeShotCaptureService Capture;FText CaptureError;const bool Executable=Capture.Initialize(Options,CaptureError);
         const FString Label=FString::Printf(TEXT("%s case %d"),Perspective?TEXT("Perspective"):TEXT("Orthographic"),Case);
         TestEqual(Label+TEXT(" validation"),Valid,Expected);TestEqual(Label+TEXT(" preflight"),UnrealToolsRuntime::GetBool(Plan,TEXT("can_proceed")),Expected);
-        TestEqual(Label+TEXT(" preview"),Preview.CanGenerate(),Expected);TestEqual(Label+TEXT(" execution preparation"),Executable,Expected);
+        TestEqual(Label+TEXT(" preview"),Preview.Validate(),Expected);TestEqual(Label+TEXT(" execution preparation"),Executable,Expected);
         if(!Expected)
         {TestEqual(Label+TEXT(" preflight reason"),UnrealToolsRuntime::GetString(Plan,TEXT("error")),Error.ToString());TestEqual(Label+TEXT(" preview reason"),Preview.GetValidationError().ToString(),Error.ToString());TestEqual(Label+TEXT(" execution reason"),CaptureError.ToString(),Error.ToString());}
         Capture.Shutdown();
@@ -271,7 +272,7 @@ bool FCubeShotRedirectorReservationTest::RunTest(const FString&)
     TestTrue(TEXT("Canonical object path remains supported"),CubeShot::Service::LoadOptions(Fixture.Mesh->GetPathName(),CanonicalSpec.Options,Options,Error));
     if(!CubeShot::Service::Jobs().IsBusy()&&CubeShot::CanExecute(Error))
     {
-        auto Args=MakeShared<FJsonObject>();Args->SetStringField(TEXT("mesh_path"),AliasPath);auto Result=CubeShot::Service::GenerateInline(Args);
+        auto Args=MakeShared<FJsonObject>();Args->SetArrayField(TEXT("mesh_paths"),UnrealToolsRuntime::Strings({AliasPath}));auto Result=CubeShot::Service::InspectBatch(Args);
         TestFalse(TEXT("Redirected generation fails safely"),UnrealToolsRuntime::GetBool(Result,TEXT("success")));TestTrue(TEXT("Redirected generation saves no output outside its reservation"),UnrealToolsRuntime::GetArray(Result,TEXT("saved")).IsEmpty());
     }
     for(const auto& Output:Fixture.Outputs)TestNull(TEXT("Canonical output was never created from the alias reservation"),FindObject<UTexture2D>(nullptr,*Output.GetObjectPath()));return true;
@@ -332,7 +333,7 @@ bool FCubeShotAsyncFailureParityTest::RunTest(const FString&)
     auto Request=MakeShared<FJsonObject>();Request->SetStringField(TEXT("request_id"),FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
     const FString Mesh=TEXT("/Game/UnrealToolsQA/NotLoaded_")+FGuid::NewGuid().ToString(EGuidFormats::Digits)+TEXT(".Mesh");Request->SetArrayField(TEXT("mesh_paths"),{MakeShared<FJsonValueString>(Mesh)});
     auto Accepted=CubeShot::Service::Submit(Request);if(!TestTrue(TEXT("No-load queue admits value-only fixture"),UnrealToolsRuntime::GetBool(Accepted,TEXT("success"))))return false;
-    auto Args=MakeShared<FJsonObject>();Args->SetStringField(TEXT("mesh_path"),Mesh);const auto Tool=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_generate"));
+    auto Args=UnrealToolsRuntime::Clone(Request);Args->SetStringField(TEXT("request_id"),FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));const auto Tool=IModelContextProtocolModule::GetChecked().FindTool(TEXT("cubeshot_job_start"));
     const auto Direct=Tool->Run(Args);const auto DirectData=UnrealToolsRuntime::GetObject(Direct.JsonObject,TEXT("structuredContent"));int32 Callbacks=0;UnrealToolsRuntime::FObject AsyncData;
     Tool->RunAsync(FModelContextProtocolToolRequestId(),Args,[&](const FModelContextProtocolToolResult& Reply){++Callbacks;AsyncData=UnrealToolsRuntime::GetObject(Reply.JsonObject,TEXT("structuredContent"));});
     TestEqual(TEXT("Async rejected request responds exactly once"),Callbacks,1);TestEqual(TEXT("Run and RunAsync preserve the same structured admission error"),UnrealToolsRuntime::GetString(AsyncData,TEXT("error_code")),UnrealToolsRuntime::GetString(DirectData,TEXT("error_code")));

@@ -20,7 +20,7 @@ bool FCubeShotViewModelDefaultsTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Default background"), Defaults.BackgroundMode, ECubeShotBackgroundMode::Transparent);
 	TestEqual(TEXT("Default projection"), Defaults.ProjectionMode, ECubeShotProjectionMode::Perspective);
 	TestTrue(TEXT("Auto Fit defaults on"), Defaults.bAutoFit);
-	TestFalse(TEXT("Generate is disabled without a mesh"), ViewModel.CanGenerate());
+	TestFalse(TEXT("Preview validation requires a mesh"), ViewModel.Validate());
 	TestFalse(TEXT("Auto Fit locks camera distance"), ViewModel.IsCameraDistanceEnabled());
 	TestTrue(TEXT("Perspective enables FOV"), ViewModel.IsFieldOfViewEnabled());
 	TestFalse(TEXT("Perspective disables Ortho Width"), ViewModel.IsOrthoWidthEnabled());
@@ -42,7 +42,7 @@ bool FCubeShotViewModelControlStateTest::RunTest(const FString& Parameters)
 
 	FCubeShotViewModel ViewModel;
 	ViewModel.SetStaticMesh(Cube);
-	TestTrue(TEXT("A valid mesh enables generation"), ViewModel.CanGenerate());
+	TestTrue(TEXT("A valid mesh passes preview validation"), ViewModel.Validate());
 
 	ViewModel.SetProjectionMode(ECubeShotProjectionMode::Orthographic);
 	ViewModel.SetAutoFit(false);
@@ -51,20 +51,20 @@ bool FCubeShotViewModelControlStateTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Manual fit enables distance"), ViewModel.IsCameraDistanceEnabled());
 
 	ViewModel.SetResolution(255);
-	TestFalse(TEXT("Out-of-range resolution disables generation"), ViewModel.CanGenerate());
+	TestFalse(TEXT("Out-of-range resolution fails preview validation"), ViewModel.Validate());
 	TestFalse(TEXT("Invalid input exposes an error"), ViewModel.GetValidationError().IsEmpty());
 
 	ViewModel.SetResolution(1000);
-	TestTrue(TEXT("In-range NPOT is valid"), ViewModel.CanGenerate());
+	TestTrue(TEXT("In-range NPOT is valid"), ViewModel.Validate());
 	TestFalse(TEXT("NPOT exposes a mip warning"), ViewModel.GetValidationWarning().IsEmpty());
 
 	ViewModel.SetBackgroundMode(ECubeShotBackgroundMode::Texture);
-	TestFalse(TEXT("Texture mode requires a texture"), ViewModel.CanGenerate());
+	TestFalse(TEXT("Texture mode requires a texture"), ViewModel.Validate());
 	TestTrue(TEXT("Texture picker is enabled in Texture mode"), ViewModel.IsBackgroundTextureEnabled());
 
 	UTexture2D* InvalidSourceTexture = NewObject<UTexture2D>();
 	ViewModel.SetBackgroundTexture(InvalidSourceTexture);
-	TestFalse(TEXT("Texture mode rejects a texture without source art"), ViewModel.CanGenerate());
+	TestFalse(TEXT("Texture mode rejects a texture without source art"), ViewModel.Validate());
 	TestTrue(
 		TEXT("Unreadable source art is reported inline"),
 		ViewModel.GetValidationError().ToString().Contains(TEXT("source"), ESearchCase::IgnoreCase));
@@ -83,14 +83,15 @@ bool FCubeShotViewModelControlStateTest::RunTest(const FString& Parameters)
 		TSF_BGRA8,
 		reinterpret_cast<const uint8*>(SourcePixels.GetData()));
 	ViewModel.SetBackgroundTexture(ReadableSourceTexture);
-	TestTrue(TEXT("Texture mode accepts readable mip 0 source art"), ViewModel.CanGenerate());
+	TestTrue(TEXT("Texture mode accepts readable mip 0 source art"), ViewModel.Validate());
 	ViewModel.SetCameraDistance(250.0);
-	TestTrue(TEXT("Unrelated numeric changes retain the cached source validation"), ViewModel.CanGenerate());
+	TestTrue(TEXT("Unrelated numeric changes retain the cached source validation"), ViewModel.Validate());
 
 	ViewModel.SetBackgroundMode(ECubeShotBackgroundMode::SolidColor);
 	ViewModel.SetGenerating(true);
 	TestFalse(TEXT("Generation locks all options"), ViewModel.AreOptionsEnabled());
-	TestFalse(TEXT("Generation disables Generate"), ViewModel.CanGenerate());
+	TestTrue(TEXT("Busy display does not change preview validation"), ViewModel.Validate());
+	TestTrue(TEXT("The display tracks the current job lock"), ViewModel.IsGenerating());
 	return true;
 }
 

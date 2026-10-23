@@ -11,7 +11,7 @@ import time
 import uuid
 
 from . import __version__
-from .config import endpoint_parts, positive_seconds, read_config
+from .config import endpoint_parts, owned_entries, positive_seconds, read_config
 from .registry import DEFAULT_URL, SERVER_NAME, active_providers, local_provider, resolve_project, version
 
 
@@ -62,75 +62,55 @@ def save_evidence(project_file, folder, evidence, *, kind="MCPCalls"):
 def required_features(provider, requests):
     features = set()
     for request in requests:
-        if request["tool"] not in provider.tools:
+        tool = request["tool"]
+        if tool not in provider.tools:
             continue
-        arguments = request.get("arguments", {})
-        if request["tool"] in provider.job_tools.values():
+        if tool in provider.job_tools.values():
             features.add("jobs")
-        if request["tool"].endswith("_profiles"):
+        if tool.endswith("_profiles"):
             features.add("profiles")
-        if request["tool"].endswith("_export_png") and "overwrite" in arguments:
-            features.add("png_overwrite")
-        if "mesh_paths" in arguments and request["tool"].endswith("_preflight"):
+        if tool.endswith("_preflight"):
             features.add("batch_preflight")
-        if set(arguments) & {"background", "background_texture", "solid_color", "auto_fit", "distance",
-                             "camera_distance", "fov", "field_of_view", "ortho_width", "profile_id",
-                             "export_png", "png_directions", "layout", "output_layout"}:
-            features.add("extended_options")
-        # PNG framing existed in the standalone export_png tool before API 1.1.
-        # Passing those settings to generation/preflight is a new capability.
-        if (not request["tool"].endswith("_export_png") and
-                set(arguments) & {"trim_transparent", "padding_pixels", "quarter_turns"}):
-            features.add("extended_options")
+        if tool.endswith("_export_png"):
+            features.add("png_overwrite")
     return features
 
 
 def check_features(provider, context, requests):
     required = required_features(provider, requests)
-    if not required:
-        return
-    capabilities = context.get("capabilities", [])
-    if isinstance(capabilities, dict):
-        capabilities = [name for name, enabled in capabilities.items() if enabled is True]
-    if not isinstance(capabilities, list) or any(not isinstance(item, str) for item in capabilities):
-        capabilities = []
-    actual = context.get("api_version", "1.0.0")
-    if version(actual) < version(provider.api_version) or not required <= set(capabilities):
-        raise FeatureUnavailableError(f"{provider.plugin} Editor API {actual} cannot provide "
-                                      f"{', '.join(sorted(required))}; expected API {provider.api_version}. "
+    capabilities = context.get("capabilities")
+    actual = context.get("api_version")
+    try:
+        supported = version(actual)[0] == 2 and version(actual) >= version(provider.api_version)
+    except ValueError:
+        supported = False
+    if (not supported or not isinstance(capabilities, list) or
+            any(not isinstance(item, str) for item in capabilities) or not required <= set(capabilities)):
+        raise FeatureUnavailableError(f"{provider.plugin} Editor API {actual!r} cannot provide "
+                                      f"{', '.join(sorted(required)) or 'the current API'}; expected API {provider.api_version}. "
                                       "Build the updated plugin and restart the target Editor.")
 
 
 def connection(project_file, providers, url=None):
-    servers = read_config(project_file).get("mcp_servers", {})
-    unified = servers.get(SERVER_NAME)
-    entries, allowed = [], set()
-    for provider in providers:
-        entry = unified if unified is not None else servers.get(provider.id, {})
-        if not isinstance(entry, dict) or "command" in entry:
-            raise ValueError("Unreal MCP requires an HTTP server configuration.")
-        for key in ("enabled_tools", "disabled_tools"):
-            if key in entry and (not isinstance(entry[key], list) or
-                                 any(not isinstance(item, str) for item in entry[key])):
-                raise ValueError(f"{key} must be an array of tool names.")
-        if entry.get("enabled", True) is not True:
-            continue
-        if any(entry.get(key) for key in ("http_headers", "env_http_headers", "bearer_token_env_var")):
-            raise ValueError("This local Unreal client does not support authenticated HTTP endpoints.")
-        allowed.update(set(provider.tools).intersection(entry.get("enabled_tools", provider.tools))
-                       - set(entry.get("disabled_tools", [])))
-        entries.append(entry)
-    if not allowed:
+    config = read_config(project_file)
+    entries = owned_entries(config, providers)
+    entry = entries.get(SERVER_NAME, {})
+    if not isinstance(entry, dict) or "command" in entry:
+        raise ValueError("Unreal MCP requires an HTTP server configuration.")
+    for key in ("enabled_tools", "disabled_tools"):
+        if key in entry and (not isinstance(entry[key], list) or
+                             any(not isinstance(item, str) for item in entry[key])):
+            raise ValueError(f"{key} must be an array of tool names.")
+    if any(entry.get(key) for key in ("http_headers", "env_http_headers", "bearer_token_env_var")):
+        raise ValueError("This local Unreal client does not support authenticated HTTP endpoints.")
+    known = {tool for provider in providers for tool in provider.tools}
+    allowed = known.intersection(entry.get("enabled_tools", known)) - set(entry.get("disabled_tools", []))
+    if entry.get("enabled", True) is not True or not allowed:
         raise ValueError("No tools are allowed by the project MCP configuration.")
-    endpoints = {entry["url"] for entry in entries if "url" in entry}
-    addresses = {endpoint_parts(endpoint)[1:] for endpoint in endpoints}
-    if len(addresses) > 1:
-        raise ValueError("Plugin MCP entries use different server addresses; run setup after resolving the conflict.")
-    endpoint = url or (sorted(endpoints)[0] if endpoints else DEFAULT_URL)
+    endpoint = url or entry.get("url", DEFAULT_URL)
     endpoint_parts(endpoint)
-    def timeout(key, default):
-        return max((positive_seconds(entry.get(key, default), key) for entry in entries), default=default)
-    return endpoint, allowed, timeout("startup_timeout_sec", 20), timeout("tool_timeout_sec", 180)
+    return (endpoint, allowed, positive_seconds(entry.get("startup_timeout_sec", 20), "startup_timeout_sec"),
+            positive_seconds(entry.get("tool_timeout_sec", 180), "tool_timeout_sec"))
 
 
 @asynccontextmanager
@@ -269,7 +249,7 @@ async def run_calls(calls, list_tools=False, *, project=None, url=None, anchor):
 
 def job_context(result):
     context = result.get("structuredContent", {})
-    return context.get("job", context)
+    return context
 
 
 async def run_and_wait(calls, *, project=None, url=None, anchor, wait_timeout=1800, poll_interval=1):
@@ -319,7 +299,7 @@ async def run_and_wait(calls, *, project=None, url=None, anchor, wait_timeout=18
                 identifier = ("job_id", context["job_id"])
             elif context.get("request_id"):
                 identifier = ("request_id", context["request_id"])
-            state = context.get("state", context.get("status"))
+            state = context.get("state")
             if state in {"succeeded", "failed", "cancelled", "interrupted"}:
                 return results
             if state not in {"queued", "running"}:
@@ -331,10 +311,10 @@ async def run_and_wait(calls, *, project=None, url=None, anchor, wait_timeout=18
             await asyncio.sleep(min(poll_interval, remaining))
 
 
-def main(argv=None, *, default_project=None, anchor):
+def main(argv=None, *, anchor):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tool", nargs="?", help="Exact manifest tool name; plugin default: status, shared default: list")
-    parser.add_argument("--project", type=Path, default=default_project,
+    parser.add_argument("--project", type=Path,
                         help="Target .uproject or directory; defaults to the project containing this entry point")
     parser.add_argument("--url", help="Override the endpoint; project identity is still checked")
     arguments = parser.add_mutually_exclusive_group()
@@ -374,7 +354,7 @@ def main(argv=None, *, default_project=None, anchor):
         print(json.dumps(results, ensure_ascii=False, indent=2))
         if args.wait:
             return int(not results or any(failed(result) for result in results) or
-                       job_context(results[-1]).get("state", job_context(results[-1]).get("status")) != "succeeded")
+                       job_context(results[-1]).get("state") != "succeeded")
         return int(any(failed(result) for result in results))
     except Exception as error:
         print(f"Unreal Tools MCP failed: {error_message(error)}", file=sys.stderr)

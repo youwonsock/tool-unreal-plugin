@@ -11,6 +11,7 @@ import unittest
 MCP = Path(__file__).resolve().parents[1]
 REPO = MCP.parent
 sys.path.insert(0, str(MCP))
+sys.path.insert(0, str(REPO / "Scripts"))
 from unreal_tools_mcp.registry import read_manifest
 
 PLUGINS = {path.parent.parent.name: path.parent.parent for path in REPO.glob("*/MCP/manifest.json")}

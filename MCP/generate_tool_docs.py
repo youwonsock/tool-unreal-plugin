@@ -66,14 +66,10 @@ def render_reference(provider, tools):
 def validate_examples(directory, provider, catalog):
     # MCP's SDK depends on jsonschema; setup and --help still use only stdlib.
     from jsonschema.validators import validator_for
-    examples = sorted(directory.glob("*-arguments.example.json")) + sorted((directory / "examples").glob("*.json"))
+    examples = sorted((directory / "examples").glob("*.json"))
     for path in examples:
         value = json.loads(path.read_text("utf-8-sig"))
-        if path.name.endswith("-arguments.example.json"):
-            role = path.name.removesuffix("-arguments.example.json").replace("-", "_")
-            calls = [{"tool": provider.id + "_" + role, "arguments": value}]
-        else:
-            calls = value if isinstance(value, list) else [value]
+        calls = value if isinstance(value, list) else [value]
         for call in calls:
             if (not isinstance(call, dict) or call.get("tool") not in provider.tools or
                     not isinstance(call.get("arguments"), dict) or set(call) - {"tool", "arguments"}):
@@ -99,6 +95,9 @@ def generate(catalog_data, *, root=ROOT, check=False):
         missing = set(provider.tools) - set(catalog)
         if missing:
             raise ValueError(f"Actual Editor catalogue is missing {provider.id} tools: {', '.join(sorted(missing))}")
+        unexpected = {name for name in catalog if name.startswith(provider.id + "_")} - set(provider.tools)
+        if unexpected:
+            raise ValueError(f"Actual Editor catalogue contains unsupported {provider.id} tools: {', '.join(sorted(unexpected))}")
         tools = [catalog[name] for name in provider.tools]
         # Validate every schema even when a particular tool has no checked example.
         from jsonschema.validators import validator_for

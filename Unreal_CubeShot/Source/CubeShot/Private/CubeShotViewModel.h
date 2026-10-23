@@ -8,8 +8,8 @@ class UStaticMesh;
 class UTexture2D;
 
 /**
- * UI state kept independent of Slate so validation and control-state rules can be
- * exercised by automation tests without opening the CubeShot tab.
+ * Preview/display options and control-state validation. Workspace options and
+ * batch admission belong to the injected controller.
  */
 class FCubeShotViewModel final
 {
@@ -37,10 +37,8 @@ public:
 	void SetResolution(int32 InResolution);
 	void SetAutoFit(bool bInAutoFit);
 	void ApplyAutoFit(const FCubeShotAutoFitResult& Result);
-	void RequestPreviewRecapture();
 
 	bool Validate();
-	bool CanGenerate() const { return bOptionsValid && !bGenerating; }
 	bool AreOptionsEnabled() const { return !bGenerating; }
 	bool IsBackgroundTextureEnabled() const;
 	bool IsFieldOfViewEnabled() const;
@@ -51,11 +49,8 @@ public:
 
 	const FText& GetValidationError() const { return ValidationError; }
 	const FText& GetValidationWarning() const { return ValidationWarning; }
-	uint64 GetRevision() const { return Revision; }
-	EChangeKind GetLastChangeKind() const { return LastChangeKind; }
 
 private:
-	void MarkChanged(EChangeKind ChangeKind);
 	void RefreshObjectPointers();
 	bool ValidateCachedBackgroundTextureSource(FText& OutError);
 	void InvalidateBackgroundTextureSourceCache();
@@ -68,9 +63,6 @@ private:
 	FText CachedBackgroundTextureSourceError;
 	UTexture2D* CachedBackgroundTexture = nullptr;
 	FGuid CachedBackgroundTextureSourceId;
-	uint64 Revision = 0;
-	EChangeKind LastChangeKind = EChangeKind::Recapture;
-	bool bOptionsValid = false;
 	bool bGenerating = false;
 	bool bHasBackgroundTextureSourceResult = false;
 	bool bCachedBackgroundTextureSourceValid = false;

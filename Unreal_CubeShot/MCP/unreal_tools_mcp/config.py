@@ -1,4 +1,4 @@
-"""Conservative Codex configuration migration and Unreal MCP server setup."""
+"""Configure the current unified Unreal MCP connection without importing older settings."""
 import argparse
 from copy import deepcopy
 import difflib
@@ -14,6 +14,10 @@ from urllib.parse import urlsplit
 
 from .registry import (DEFAULT_URL, SERVER_NAME, SETTINGS_SECTION, active_providers,
                        local_provider, resolve_project)
+
+# Former server names remain reserved even when their plugin is disabled or
+# removed. Detect settings by name without reading an inactive manifest.
+RETIRED_PROVIDER_SERVERS = frozenset({"cubeshot", "fbx_exporter"})
 
 
 def read_text(path):
@@ -39,7 +43,8 @@ def read_state(project_file):
     try:
         data = json.loads(path.read_text("utf-8-sig"))
         tools = data.get("enabled_tools") if isinstance(data, dict) else None
-        if (type(data.get("schema_version")) is not int or data.get("schema_version") != 1 or data.get("server") != SERVER_NAME or
+        if (type(data.get("schema_version")) is not int or data.get("schema_version") != 1 or
+                data.get("api_version") != "2.0.0" or data.get("server") != SERVER_NAME or
                 not isinstance(tools, list) or not tools or any(not isinstance(tool, str) for tool in tools) or
                 len(set(tools)) != len(tools)):
             raise ValueError("Invalid generated setup state")
@@ -105,45 +110,28 @@ def endpoint_parts(url):
 
 def owned_entries(config, providers):
     servers = config.get("mcp_servers", {})
-    names = {SERVER_NAME, *(provider.id for provider in providers)}
-    entries = {name: servers[name] for name in sorted(names) if name in servers}
+    provider_servers = RETIRED_PROVIDER_SERVERS | {provider.id for provider in providers}
+    retired = sorted(provider_servers.intersection(servers))
+    if retired:
+        raise ValueError("Provider-specific MCP tables are unsupported: " + ", ".join(retired) +
+                         ". Remove them manually and configure unreal_tools.")
+    entries = {SERVER_NAME: servers[SERVER_NAME]} if SERVER_NAME in servers else {}
     for name, entry in entries.items():
         if not isinstance(entry, dict) or not isinstance(entry.get("url"), str):
             raise ValueError(f"mcp_servers.{name} must be an HTTP server table with a URL.")
         endpoint_parts(entry["url"])
-    urls = {(endpoint_parts(entry["url"])[1], endpoint_parts(entry["url"])[2]) for entry in entries.values()}
-    if len(urls) > 1:
-        raise ValueError("Plugin MCP entries use different server addresses. Resolve the conflict before merging them.")
     return entries
 
 
-def validate_ownership(entries, providers, replace_names, generated_state=None):
-    groups = {provider.id: set(provider.tools) for provider in providers}
-    known = set().union(*groups.values())
+def validate_ownership(entries, replace_owned, generated_state=None):
     fields = {"url", "enabled_tools", "disabled_tools", "enabled", "startup_timeout_sec", "tool_timeout_sec"}
     for name, entry in entries.items():
-        if name in replace_names:
+        if replace_owned:
             continue
         tools = entry.get("enabled_tools")
         valid = (isinstance(tools, list) and all(isinstance(tool, str) for tool in tools)
                  and len(set(tools)) == len(tools))
-        selected = set(tools) if valid else set()
-        if name == SERVER_NAME:
-            if generated_state is not None:
-                owned = valid and tools == generated_state["enabled_tools"]
-            else:
-                # Only exact full provider groups qualify without generation history.
-                # A partial custom allow list cannot be inferred to be managed.
-                owned = bool(selected) and selected <= known and all(
-                    not selected.intersection(set(provider.tools)) or
-                    selected.intersection(set(provider.tools)) in
-                    [set(provider.tools), *(set(group) for group in provider.compatible_tool_sets)]
-                    for provider in providers)
-        else:
-            provider = next(provider for provider in providers if provider.id == name)
-            # A generated state always records the unified table. A later legacy
-            # table is a user edit, not a prior managed installation to expand.
-            owned = generated_state is None and selected in [set(provider.tools), *(set(group) for group in provider.compatible_tool_sets)]
+        owned = generated_state is not None and valid and tools == generated_state["enabled_tools"]
         if (not valid or not owned or entry.get("enabled", True) is not True or entry.get("disabled_tools")
                 or set(entry) - fields):
             raise ValueError(f"mcp_servers.{name} has custom restrictions or unknown settings. No files changed. "
@@ -182,14 +170,13 @@ def update_codex(text, entries, target):
     return updated
 
 
-def prepare(project_file, port=None, url_path=None, *, required=None, replace_names=()):
+def prepare(project_file, port=None, url_path=None, *, required=None, replace_owned=False):
     providers, active = active_providers(project_file, required=required)
     project = project_file.parent
     codex = project / ".codex/config.toml"
     config = read_config(project_file)
     entries = owned_entries(config, providers)
-    validate_ownership(entries, providers, set(entries) if replace_names == "all" else set(replace_names),
-                       None if replace_names == "all" else read_state(project_file))
+    validate_ownership(entries, replace_owned, None if replace_owned else read_state(project_file))
     default_ini = project / "Config/DefaultEditorPerProjectUserSettings.ini"
     user_inis = sorted((project / "Saved/Config").glob("*/EditorPerProjectUserSettings.ini"))
     settings = ini_settings(read_text(default_ini))
@@ -219,7 +206,7 @@ def prepare(project_file, port=None, url_path=None, *, required=None, replace_na
         overrides = ini_settings(read_text(path))
         if overrides:
             changes[path] = update_ini(read_text(path), {key: value for key, value in values.items() if key in overrides})
-    state = {"schema_version": 1, "server": SERVER_NAME, "enabled_tools": target["enabled_tools"],
+    state = {"schema_version": 1, "api_version": "2.0.0", "server": SERVER_NAME, "enabled_tools": target["enabled_tools"],
              "providers": [{"id": provider.id, "api_version": provider.api_version,
                             "tools": list(provider.tools)} for provider in active]}
     # The state is the commit marker. It must be replaced after every configuration file.
@@ -296,15 +283,12 @@ def main(argv=None, *, anchor):
     parser.add_argument("--url-path")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--replace-owned-config", action="store_true",
-                        help="Replace custom restrictions/settings only in discovered provider and unreal_tools entries")
-    if required:
-        parser.add_argument("--replace-" + required.replace("_", "-"), dest="replace_local", action="store_true",
-                            help="Compatibility option: replace only this provider's legacy client entry")
+                        help="Explicitly replace the unified unreal_tools entry and setup state")
     args = parser.parse_args(argv)
     try:
         project_file = resolve_project(args.project, anchor=anchor)
-        replace = "all" if args.replace_owned_config else ([required] if getattr(args, "replace_local", False) else [])
-        url, providers, changes = prepare(project_file, args.port, args.url_path, required=required, replace_names=replace)
+        url, providers, changes = prepare(project_file, args.port, args.url_path, required=required,
+                                         replace_owned=args.replace_owned_config)
         write_changes(changes, dry_run=args.dry_run)
         print("PROJECT=" + str(project_file))
         print("MCP_URL=" + url)

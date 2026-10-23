@@ -42,7 +42,6 @@ namespace FBXExporter
 	FFBXExporterResult ExportStaticMeshUnattended(UStaticMesh* StaticMesh, const FFBXExporterOptions& Options, bool bOverwrite = false);
 	TUniquePtr<UnrealToolsRuntime::IItemRunner> CreateExportRunner(const UnrealToolsRuntime::FItemSpec& Spec, const FString& JobId);
 	void InitializeJobs();
-	bool AreJobsInitialized();
 	void ShutdownJobs();
 	UnrealToolsRuntime::FProfileStore& Profiles();
 	UnrealToolsRuntime::FJobService& Jobs();
@@ -56,7 +55,6 @@ namespace FBXExporter
 	FString LastOutputRoot();
 
 	void PopulateContentBrowserMenu(UToolMenu* Menu);
-	void ShowExportDialog(const TArray<FAssetData>& SelectedAssets);
 
 	FString MakeSafeFileName(const FString& InName);
 	EFBXExporterTextureMap GetRequiredTextureMapsForBake(EFBXExporterTextureMap SelectedMaps);
@@ -70,7 +68,6 @@ namespace FBXExporter
 
 	namespace Testing
 	{
-		FString ReadAndMigrateLastOutputRoot();
 		bool PublishStagedFiles(const FString& StagingDirectory, const FString& FinalDirectory, FString& OutError);
 		bool PublishWithJournal(const FString& StagingDirectory, const FString& FinalDirectory, const FString& JournalPath, FString& OutError, const FString& JobId = FString());
 		void ScanRecoveryDiagnostics(UnrealToolsRuntime::FJobService& Service, const FString& RecoveryRoot, const TFunction<void()>& BeforeFileScan = {});

@@ -8,30 +8,6 @@ namespace FBXExporter::Application
 {
 using namespace UnrealToolsRuntime;
 
-bool ReadFlatRequest(const FObject& Input, FItemSpec& Spec, FString& Error)
-{
-	if (!Input.IsValid() || !Input->TryGetStringField(TEXT("mesh_path"), Spec.MeshPath) ||
-		!FPackageName::IsValidObjectPath(Spec.MeshPath) || Spec.MeshPath.Contains(TEXT(":")))
-	{ Error = TEXT("mesh_path must be an exact Static Mesh object path."); return false; }
-	if (Input->HasField(TEXT("overwrite")) && !Input->HasTypedField<EJson::Boolean>(TEXT("overwrite")))
-	{ Error = TEXT("overwrite must be boolean."); return false; }
-	Spec.bOverwrite = GetBool(Input, TEXT("overwrite"));
-	Spec.Options = Clone(Input);
-	Spec.Options->RemoveField(TEXT("mesh_path"));
-	Spec.Options->RemoveField(TEXT("overwrite"));
-	return true;
-}
-
-FObject SingleRequest(const FItemSpec& Spec)
-{
-	auto Input = MakeShared<FJsonObject>();
-	Input->SetStringField(TEXT("request_id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-	Input->SetArrayField(TEXT("mesh_paths"), Strings({Spec.MeshPath}));
-	Input->SetObjectField(TEXT("options"), Clone(Spec.Options));
-	Input->SetBoolField(TEXT("overwrite"), Spec.bOverwrite);
-	return Input;
-}
-
 FBatchPlan InspectBatch(const FObject& Request)
 {
 	FBatchPlan Out;

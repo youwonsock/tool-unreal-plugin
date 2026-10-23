@@ -53,12 +53,6 @@ namespace
         return Out;
     }
 
-    TSharedPtr<FJsonObject> OptionsFromParams(const TSharedPtr<FJsonObject>& Params)
-    {
-        TSharedPtr<FJsonObject> Options = UnrealToolsRuntime::Clone(Params);
-        for (const TCHAR* Key : {TEXT("mesh_path"), TEXT("mesh_paths"), TEXT("overwrite")}) Options->RemoveField(Key);
-        return Options;
-    }
     FModelContextProtocolToolResult ObjectResult(const TSharedPtr<FJsonObject>& Data)
     {
         bool Success = false;
@@ -76,7 +70,7 @@ namespace
         Data->SetBoolField(TEXT("capture_available"), Available && !CubeShot::Service::Jobs().IsBusy() && Scanned && Issues.IsEmpty());
         const FString Blocked=!Available?PolicyError.ToString():!Scanned?TEXT("Saved job records are still being scanned."):!Issues.IsEmpty()?TEXT("Review unresolved saved record diagnostics."):CubeShot::Service::Jobs().IsBusy()?TEXT("A CubeShot job is queued or running."):TEXT("");
         Data->SetStringField(TEXT("blocked_reason"),Blocked);Data->SetBoolField(TEXT("initial_scan_complete"),Scanned);
-        Data->SetStringField(TEXT("api_version"), TEXT("1.2.0")); Data->SetStringField(TEXT("plugin_version"), TEXT("1.2.0"));
+        Data->SetStringField(TEXT("api_version"), TEXT("2.0.0")); Data->SetStringField(TEXT("plugin_version"), TEXT("2.0.0"));
         Data->SetArrayField(TEXT("capabilities"), Strings({TEXT("jobs"),TEXT("profiles"),TEXT("batch_preflight"),TEXT("capture_options"),TEXT("extended_options"),TEXT("png_framing"),TEXT("registered_mount_search"),TEXT("recovery_acknowledgement"),TEXT("png_overwrite"),TEXT("history_retention"),TEXT("record_diagnostics")}));
         Data->SetStringField(TEXT("output_root"), TEXT("/Game/CubeShot"));
         Data->SetStringField(TEXT("capture_backend"), TEXT("CubeShotCaptureService"));
@@ -130,27 +124,12 @@ namespace
 
     FModelContextProtocolToolResult Preflight(const TSharedPtr<FJsonObject>& Params)
     {
-        const bool Single=Params->HasField(TEXT("mesh_path")), Batch=Params->HasField(TEXT("mesh_paths"));
-        if(Single==Batch)return Error(TEXT("Supply exactly one of mesh_path or mesh_paths."));
-        auto Request=MakeShared<FJsonObject>();
-        Request->SetStringField(TEXT("request_id"),FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-        Request->SetObjectField(TEXT("options"),OptionsFromParams(Params));
-        Request->SetArrayField(TEXT("mesh_paths"),Single ? TArray<TSharedPtr<FJsonValue>>{MakeShared<FJsonValueString>(Params->GetStringField(TEXT("mesh_path")))} : Params->GetArrayField(TEXT("mesh_paths")));
-        auto Plan=CubeShot::Service::InspectBatch(Request);
-        if(!Single)return ObjectResult(Plan);
-        const auto Items=UnrealToolsRuntime::GetArray(Plan,TEXT("items"));
-        if(Items.IsEmpty())return ObjectResult(Plan);
-        auto Item=UnrealToolsRuntime::Clone(Items[0]->AsObject());
-        if(!UnrealToolsRuntime::GetBool(Plan,TEXT("can_proceed")))
-        {
-            Item->SetBoolField(TEXT("success"),false);Item->SetBoolField(TEXT("can_proceed"),false);
-            if(UnrealToolsRuntime::GetString(Item,TEXT("error")).IsEmpty())
-            {Item->SetStringField(TEXT("error"),UnrealToolsRuntime::GetString(Plan,TEXT("error")));Item->SetStringField(TEXT("error_code"),TEXT("preflight_failed"));}
-        }
-        return ObjectResult(Item);
+        auto Request = UnrealToolsRuntime::Clone(Params);
+        if (!Request->HasField(TEXT("request_id")))
+            Request->SetStringField(TEXT("request_id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+        return ObjectResult(CubeShot::Service::InspectBatch(Request));
     }
 
-    FModelContextProtocolToolResult Generate(const TSharedPtr<FJsonObject>& Params) { return ObjectResult(CubeShot::Service::GenerateInline(Params)); }
     FModelContextProtocolToolResult Profiles(const TSharedPtr<FJsonObject>& Params) { return ObjectResult(CubeShot::Service::HandleProfiles(Params)); }
     FModelContextProtocolToolResult JobStart(const TSharedPtr<FJsonObject>& Params) { return ObjectResult(CubeShot::Service::Submit(Params)); }
     FModelContextProtocolToolResult JobStatus(const TSharedPtr<FJsonObject>& Params) { return ObjectResult(CubeShot::Service::Jobs().Status(Params)); }
@@ -198,15 +177,8 @@ namespace
                 if(!bRegistered||Concrete->Generation!=RegistrationGeneration)
                 {OnComplete(ObjectResult(UnrealToolsRuntime::Error(TEXT("CubeShot MCP registration ended before request execution."),TEXT("EDITOR_INTERRUPTED"))));return;}
                 if(!Params.IsValid()){OnComplete(Error(TEXT("Expected an arguments object.")));return;}
-                if (Self->GetName() == TEXT("cubeshot_generate"))
-                {
-                    FString Message;
-                    // Validate the exact same arguments before accepting a legacy asynchronous request.
-                    if (!UnrealToolsRuntime::ValidateSchema(Params, Concrete->Schema, Message)) { OnComplete(Error(Message)); return; }
-                    const auto Accepted=CubeShot::Service::GenerateAsync(Params, [Self, OnComplete](const TSharedPtr<FJsonObject>& Generated) { OnComplete(ObjectResult(Generated)); });
-                    if(!UnrealToolsRuntime::GetBool(Accepted,TEXT("success")))OnComplete(ObjectResult(Accepted));
-                }
-                else OnComplete(Self->Run(Params));
+                OnComplete(Self->Run(Params));
+
             };
             if (IsInGameThread()) Work();
             else AsyncTask(ENamedThreads::GameThread, MoveTemp(Work));
@@ -229,19 +201,18 @@ namespace
         Add(TEXT("cubeshot_find_meshes"), TEXT("Search the current project's StaticMesh assets by name. Returns exact object paths without loading meshes. Narrow query/root when truncated."),
             TEXT(R"({"type":"object","properties":{"query":{"type":"string","minLength":1},"root":{"type":"string","default":"/Game"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":40}},"required":["query"],"additionalProperties":false})"), FindMeshes);
         const FString OptionProperties = TEXT(R"("resolution":{"type":"integer","minimum":256,"maximum":4096,"default":512},"projection":{"type":"string","enum":["orthographic","perspective"],"default":"orthographic"},"background":{"type":"string","enum":["transparent","solid","texture"],"default":"transparent"},"background_texture":{"type":"string"},"solid_color":{"type":"array","minItems":4,"maxItems":4,"items":{"type":"number","minimum":0,"maximum":1}},"auto_fit":{"type":"boolean","default":true},"camera_distance":{"type":"number","minimum":0.01,"maximum":10000000},"field_of_view":{"type":"number","minimum":1,"maximum":170},"ortho_width":{"type":"number","minimum":0.01,"maximum":10000000},"export_png":{"type":"boolean","default":false},"png_directions":{"type":"array","minItems":1,"maxItems":6,"uniqueItems":true,"items":{"type":"string","enum":["Front","Back","Left","Right","Top","Bottom"]}},"trim_transparent":{"type":"boolean","default":true},"padding_pixels":{"type":"integer","minimum":0,"maximum":64,"default":8},"quarter_turns":{"type":"integer","minimum":0,"maximum":3,"default":0})");
-        const FString PreflightSchema = TEXT("{\"type\":\"object\",\"properties\":{\"mesh_path\":{\"type\":\"string\"},\"mesh_paths\":{\"type\":\"array\",\"minItems\":1,\"uniqueItems\":true,\"items\":{\"type\":\"string\"}},") + OptionProperties + TEXT("},\"oneOf\":[{\"required\":[\"mesh_path\"]},{\"required\":[\"mesh_paths\"]}],\"additionalProperties\":false}");
-        Add(TEXT("cubeshot_preflight"), TEXT("Validate one mesh_path or a mesh_paths batch without generating assets. Returns six Texture2D paths, selected PNG paths, errors, warnings and overwrite requirements. Supports all capture options and registered mounts."), *PreflightSchema, Preflight);
-        const FString GenerateSchema = TEXT("{\"type\":\"object\",\"properties\":{\"mesh_path\":{\"type\":\"string\"},\"overwrite\":{\"type\":\"boolean\",\"default\":false},") + OptionProperties + TEXT("},\"required\":[\"mesh_path\"],\"additionalProperties\":false}");
-        Add(TEXT("cubeshot_generate"), TEXT("Capture and save six Texture2D views. The asynchronous MCP request completes after the staged operation; direct Run executes the same steps inline. Requires rendering Editor with PIE/SIE stopped. Defaults remain 512/orthographic/transparent. Existing assets retain identity. Partial saves report dirty packages and staging."), *GenerateSchema, Generate);
         Add(TEXT("cubeshot_profiles"), TEXT("List/get/save/delete CubeShot profiles. Builtins editor_default and item_icon are immutable. Save takes a versioned provider/id/display_name/options profile JSON; overwrite approvals are never stored."),
             TEXT(R"({"type":"object","properties":{"action":{"type":"string","enum":["list","get","save","delete"]},"id":{"type":"string"},"overwrite":{"type":"boolean","default":false},"profile":{"type":"object"}},"required":["action"],"additionalProperties":false})"), Profiles);
         const FString OptionsSchema = TEXT("{\"type\":\"object\",\"properties\":{") + OptionProperties + TEXT("},\"additionalProperties\":false}");
         const FString StartSchema = TEXT("{\"type\":\"object\",\"properties\":{\"request_id\":{\"type\":\"string\"},\"mesh_paths\":{\"type\":\"array\",\"minItems\":1,\"uniqueItems\":true,\"items\":{\"type\":\"string\"}},\"profile_id\":{\"type\":\"string\"},\"options\":") + OptionsSchema + TEXT(",\"overrides\":{\"type\":\"object\",\"additionalProperties\":") + OptionsSchema + TEXT("},\"overwrite\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"request_id\",\"mesh_paths\"],\"additionalProperties\":false}");
+        auto PreflightSchema = UnrealToolsRuntime::Parse(StartSchema);
+        PreflightSchema->SetArrayField(TEXT("required"), Strings({TEXT("mesh_paths")}));
+        Add(TEXT("cubeshot_preflight"), TEXT("Inspect ordered mesh_paths with common options, profile_id and per-mesh overrides. Returns items, errors, warnings and overwrite requirements without writing files."), *UnrealToolsRuntime::JsonText(PreflightSchema), Preflight);
         Add(TEXT("cubeshot_job_start"), TEXT("Enqueue an ordered CubeShot batch with a durable request_id. Same ID and same request returns the original job; changed request is rejected. Options priority: overrides, common options, profile, API defaults. Admission performs no mesh loads. Overwrite defaults false for Texture2D and PNG."), *StartSchema, JobStart);
         Add(TEXT("cubeshot_job_status"), TEXT("Read a persisted job by job_id or request_id. success denotes successful lookup; state denotes actual execution outcome. Reports ordered items, progress, output and recovery paths."), TEXT(R"({"type":"object","properties":{"job_id":{"type":"string","minLength":1},"request_id":{"type":"string","minLength":1}},"oneOf":[{"required":["job_id"]},{"required":["request_id"]}],"additionalProperties":false})"), JobStatus);
         Add(TEXT("cubeshot_job_control"), TEXT("Request cancel at a safe precommit boundary or acknowledge_recovery to release reviewed output reservations. Acknowledgement does not restore/delete files. Cancellation acceptance differs from application."), TEXT(R"({"type":"object","properties":{"action":{"type":"string","enum":["cancel","acknowledge_recovery"]},"job_id":{"type":"string","minLength":1},"request_id":{"type":"string","minLength":1}},"required":["action"],"oneOf":[{"required":["job_id"]},{"required":["request_id"]}],"additionalProperties":false})"), JobControl);
-        Add(TEXT("cubeshot_export_png"), TEXT("Export a generated CubeShot texture to Saved/CubeShot/MCPExports. Optionally trim transparent margins with padding and rotate clockwise in 90-degree steps for item-slot framing. Captured color/alpha pixels are preserved without resampling; the source texture is unchanged. overwrite defaults true for legacy compatibility; false protects existing files. existing_file_observed is advisory and does not prove a concurrent replacement. Returns dimensions, applied options and alpha coverage."),
-            TEXT(R"({"type":"object","properties":{"texture_path":{"type":"string"},"trim_transparent":{"type":"boolean","default":false},"padding_pixels":{"type":"integer","minimum":0,"maximum":64,"default":8},"quarter_turns":{"type":"integer","minimum":0,"maximum":3,"default":0},"overwrite":{"type":"boolean","default":true}},"required":["texture_path"],"additionalProperties":false})"), ExportPng);
+        Add(TEXT("cubeshot_export_png"), TEXT("Export a generated CubeShot texture to Saved/CubeShot/MCPExports. Optionally trim transparent margins with padding and rotate clockwise in 90-degree steps for item-slot framing. Captured color/alpha pixels are preserved without resampling; the source texture is unchanged. overwrite defaults false; true explicitly replaces an existing file. existing_file_observed is advisory and does not prove a concurrent replacement. Returns dimensions, applied options and alpha coverage."),
+            TEXT(R"({"type":"object","properties":{"texture_path":{"type":"string"},"trim_transparent":{"type":"boolean","default":false},"padding_pixels":{"type":"integer","minimum":0,"maximum":64,"default":8},"quarter_turns":{"type":"integer","minimum":0,"maximum":3,"default":0},"overwrite":{"type":"boolean","default":false}},"required":["texture_path"],"additionalProperties":false})"), ExportPng);
     }
 }
 

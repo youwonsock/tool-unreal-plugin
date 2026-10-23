@@ -91,26 +91,12 @@ namespace
 		return Result(Data, true);
 	}
 
-	struct FRequest { UnrealToolsRuntime::FItemSpec Spec; };
-	bool ReadRequest(const TSharedPtr<FJsonObject>& Params, FRequest& Request, FString& Error)
-	{ return Application::ReadFlatRequest(Params, Request.Spec, Error); }
-
-	void AddOptions(const TSharedRef<FJsonObject>& Data, const FRequest& Request)
-	{
-		const FFBXExporterOptions Options = OptionsFromJson(Data->HasField(TEXT("maps")) ? Data : Request.Spec.Options);
-		Data->SetStringField(TEXT("mesh_path"), Request.Spec.MeshPath);
-		if (!Data->HasField(TEXT("output_root"))) Data->SetStringField(TEXT("output_root"), Options.OutputRoot);
-		if (!Data->HasField(TEXT("resolution"))) Data->SetNumberField(TEXT("resolution"), Options.BakeResolution);
-		Data->SetArrayField(TEXT("selected_maps"), Strings(MapNames(Options.TextureMaps)));
-		Data->SetBoolField(TEXT("textures_embedded"), Options.bEmbedTexturesInFbx && Options.TextureMaps != EFBXExporterTextureMap::None);
-	}
-
 	FModelContextProtocolToolResult Status(const TSharedPtr<FJsonObject>&)
 	{
 		TSharedRef<FJsonObject> Data = MakeShared<FJsonObject>();
 		Data->SetStringField(TEXT("plugin"), TEXT("FBX_Exporter"));
-		Data->SetStringField(TEXT("plugin_version"), TEXT("1.2.0"));
-		Data->SetStringField(TEXT("api_version"), TEXT("1.2.0"));
+		Data->SetStringField(TEXT("plugin_version"), TEXT("2.0.0"));
+		Data->SetStringField(TEXT("api_version"), TEXT("2.0.0"));
 		Data->SetArrayField(TEXT("capabilities"), Strings({TEXT("profiles"), TEXT("jobs"), TEXT("request_id"), TEXT("batch_preflight"), TEXT("extended_options"), TEXT("asset_path"), TEXT("recovery"), TEXT("linear_direct_textures"), TEXT("history_retention"), TEXT("record_diagnostics")}));
 		Data->SetStringField(TEXT("project"), FApp::GetProjectName());
 		Data->SetStringField(TEXT("project_file"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));
@@ -185,20 +171,9 @@ namespace
 
 	FModelContextProtocolToolResult Preflight(const TSharedPtr<FJsonObject>& Params)
 	{
-		const bool bBatch = Params->HasField(TEXT("mesh_paths"));
-		if (bBatch && Params->HasField(TEXT("mesh_path"))) return Error(TEXT("Use mesh_path or mesh_paths, not both."));
-		auto Input = UnrealToolsRuntime::Clone(Params);
-		Input->RemoveField(TEXT("mesh_paths")); Input->RemoveField(TEXT("mesh_path"));
-		auto Request = MakeShared<FJsonObject>();
-		Request->SetStringField(TEXT("request_id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-		Request->SetObjectField(TEXT("options"), Input);
-		if (bBatch) Request->SetField(TEXT("mesh_paths"), Params->TryGetField(TEXT("mesh_paths")));
-		else
-		{
-			FString Path;
-			if (!Params->TryGetStringField(TEXT("mesh_path"), Path)) return Error(TEXT("mesh_path or mesh_paths is required."));
-			Request->SetArrayField(TEXT("mesh_paths"), {MakeShared<FJsonValueString>(Path)});
-		}
+		auto Request = UnrealToolsRuntime::Clone(Params);
+		if (!Request->HasField(TEXT("request_id")))
+			Request->SetStringField(TEXT("request_id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
 		const auto Plan = Application::InspectBatch(Request);
 		TArray<TSharedPtr<FJsonValue>> Items;
 		const bool bBusy = IsExportInProgress();
@@ -206,28 +181,29 @@ namespace
 		{
 			auto Data = Application::InspectItemJson(Item);
 			Data->SetBoolField(TEXT("export_in_progress"), bBusy);
-			if (bBusy) { Data->SetBoolField(TEXT("can_export"), false); Data->SetBoolField(TEXT("success"), false); if (!Data->HasField(TEXT("error"))) { Data->SetStringField(TEXT("error"), TEXT("An FBX export is already running.")); Data->SetStringField(TEXT("error_code"), TEXT("BUSY")); } }
+			if (bBusy)
+			{
+				Data->SetBoolField(TEXT("can_export"), false);
+				Data->SetBoolField(TEXT("success"), false);
+				if (!Data->HasField(TEXT("error")))
+				{
+					Data->SetStringField(TEXT("error"), TEXT("An FBX export is already running."));
+					Data->SetStringField(TEXT("error_code"), TEXT("BUSY"));
+				}
+			}
 			Items.Add(MakeShared<FJsonValueObject>(Data));
 		}
-		if (!bBatch && Items.Num() == 1) return Result(Items[0]->AsObject().ToSharedRef(), !Plan.CanExport() || bBusy);
 		auto Data = MakeShared<FJsonObject>();
 		Data->SetBoolField(TEXT("can_export"), Plan.CanExport() && !bBusy);
 		Data->SetArrayField(TEXT("items"), Items);
 		Data->SetArrayField(TEXT("errors"), Strings(Plan.Errors));
 		Data->SetBoolField(TEXT("export_in_progress"), bBusy);
-		if (bBusy && Plan.Errors.IsEmpty()) { Data->SetStringField(TEXT("error"), TEXT("An FBX export is already running.")); Data->SetStringField(TEXT("error_code"), TEXT("BUSY")); }
+		if (bBusy)
+		{
+			Data->SetStringField(TEXT("error"), TEXT("An FBX export is already running."));
+			Data->SetStringField(TEXT("error_code"), TEXT("BUSY"));
+		}
 		return Result(Data, !Plan.CanExport() || bBusy);
-	}
-
-	FModelContextProtocolToolResult Export(const TSharedPtr<FJsonObject>& Params)
-	{
-		FRequest Request;
-		FString Message;
-		if (!ReadRequest(Params, Request, Message)) return Error(Message);
-		const auto Data = Jobs().RunInline(Request.Spec, Message);
-		if (!Data.IsValid()) return Error(Message);
-		AddOptions(Data.ToSharedRef(), Request);
-		return Result(Data.ToSharedRef(), !Data->GetBoolField(TEXT("success")));
 	}
 
 	FModelContextProtocolToolResult ProfilesTool(const TSharedPtr<FJsonObject>& Params)
@@ -278,16 +254,10 @@ namespace
 		{
 			const TSharedRef<IModelContextProtocolTool> Self = AsShared();
 			const uint64 ExpectedGeneration = Generation;
-			auto Work = [Self, Params, OnComplete, ExpectedGeneration]()
+			auto Work = [Self, Params=Params.IsValid() ? UnrealToolsRuntime::Clone(Params) : TSharedPtr<FJsonObject>(), OnComplete, ExpectedGeneration]()
 			{
 				if (!bRegistered || ExpectedGeneration != RegistrationGeneration) { OnComplete(Error(TEXT("FBX tool registration changed while this request waited for the game thread."), TEXT("EDITOR_INTERRUPTED"))); return; }
-				if (Self->GetName() != TEXT("fbx_exporter_export")) { OnComplete(Self->Run(Params)); return; }
-				FString ValidationError;
-				if (!ValidateArguments(Params, Self->GetInputJsonSchema(), ValidationError)) { OnComplete(Error(ValidationError)); return; }
-				FRequest Request; FString Message;
-				if (!ReadRequest(Params, Request, Message)) { OnComplete(Error(Message)); return; }
-				const auto Accepted = Jobs().StartLegacyStructured(Request.Spec, [OnComplete, Request](UnrealToolsRuntime::FObject Data) { AddOptions(Data.ToSharedRef(), Request); OnComplete(Result(Data.ToSharedRef(), !Data->GetBoolField(TEXT("success")))); });
-				if (!UnrealToolsRuntime::GetBool(Accepted, TEXT("success"))) OnComplete(Result(Accepted.ToSharedRef(), true));
+				OnComplete(Self->Run(Params));
 			};
 			if (IsInGameThread() && !bForcePostRequestsForTesting) Work();
 			else AsyncTask(ENamedThreads::GameThread, MoveTemp(Work));
@@ -317,16 +287,15 @@ namespace
 			ReadSchema(TEXT(R"({"type":"object","properties":{},"additionalProperties":false})")), Status);
 		Add(TEXT("fbx_exporter_find_meshes"), TEXT("Find Static Mesh assets by name in this project or a mounted content root, without loading them. Returns exact object paths. Narrow query/root if truncated; retry if asset_registry_loading is true."),
 			ReadSchema(TEXT(R"({"type":"object","properties":{"query":{"type":"string","minLength":1},"root":{"type":"string","default":"/Game"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":40}},"required":["query"],"additionalProperties":false})")), FindMeshes);
-		const TCHAR* ExportSchema = TEXT(R"({"type":"object","properties":{"mesh_path":{"type":"string","description":"Exact Static Mesh object path from fbx_exporter_find_meshes."},"output_root":{"type":"string","description":"Absolute output root. Default: the current project's Saved/FBX_Exporter/Exports. A mesh-named subfolder is created."},"resolution":{"type":"integer","enum":[512,1024,2048,4096],"default":2048},"maps":{"type":"array","items":{"type":"string","enum":["BaseColor","Normal","Mask","Occlusion","Emission","Opacity"]},"uniqueItems":true,"description":"Omit for all six maps; [] exports geometry only."},"embed_textures":{"type":"boolean","default":false,"description":"Include PNG bytes inside FBX. External PNGs and material JSON are still produced when maps are selected."},"reuse_direct_textures":{"type":"boolean","default":true},"output_layout":{"type":"string","enum":["mesh_name","asset_path"],"default":"mesh_name"}},"required":["mesh_path"],"additionalProperties":false})");
-		Add(TEXT("fbx_exporter_preflight"), TEXT("Check mesh LOD0/UV0, renderer and output paths without writing files or opening dialogs. Reports requires_overwrite; replacement includes user files inside the mesh folder. Filesystem permissions and actual bake success are checked during export."), [&]() { auto Schema = ReadSchema(ExportSchema); Schema->RemoveField(TEXT("required")); Schema->GetObjectField(TEXT("properties"))->SetObjectField(TEXT("mesh_paths"), ReadSchema(TEXT(R"({"type":"array","minItems":1,"items":{"type":"string"},"uniqueItems":true})"))); return Schema; }(), Preflight);
-		const TSharedRef<FJsonObject> WriteSchema = ReadSchema(ExportSchema);
-		WriteSchema->GetObjectField(TEXT("properties"))->SetObjectField(TEXT("overwrite"), ReadSchema(TEXT(R"({"type":"boolean","default":false,"description":"Explicitly replace the entire existing mesh output folder, including user files. Inspect preflight first."})")));
-		Add(TEXT("fbx_exporter_export"), TEXT("Export one Static Mesh using FBX_Exporter, with selected PNGs and optional embedded PNG bytes. Requires PIE stopped and a rendering Editor for textures. Run preflight first; existing output is refused unless overwrite=true. Runs to completion on the Editor game thread; allow a long timeout for baking. Returns saved files, warnings and errors. JSON is metadata; FBX stores texture connections."), WriteSchema, Export);
+		const TCHAR* OptionsSchema = TEXT(R"({"type":"object","properties":{"output_root":{"type":"string","description":"Absolute output root. Default: the current project's Saved/FBX_Exporter/Exports. A mesh-named subfolder is created."},"resolution":{"type":"integer","enum":[512,1024,2048,4096],"default":2048},"maps":{"type":"array","items":{"type":"string","enum":["BaseColor","Normal","Mask","Occlusion","Emission","Opacity"]},"uniqueItems":true,"description":"Omit for all six maps; [] exports geometry only."},"embed_textures":{"type":"boolean","default":false,"description":"Include PNG bytes inside FBX. External PNGs and material JSON are still produced when maps are selected."},"reuse_direct_textures":{"type":"boolean","default":true},"output_layout":{"type":"string","enum":["mesh_name","asset_path"],"default":"mesh_name"}},"additionalProperties":false})");
 		Add(TEXT("fbx_exporter_profiles"), TEXT("List/get/save/delete project FBX profiles. Builtin pbr and geometry_only are immutable. Profiles never store overwrite approval."),
 			ReadSchema(TEXT(R"({"type":"object","properties":{"action":{"type":"string","enum":["list","get","save","delete"]},"id":{"type":"string"},"profile":{"type":"object"},"overwrite":{"type":"boolean","default":false}},"required":["action"],"additionalProperties":false})")), ProfilesTool);
-		const auto OptionSchema = ReadSchema(ExportSchema); OptionSchema->RemoveField(TEXT("required")); OptionSchema->GetObjectField(TEXT("properties"))->RemoveField(TEXT("mesh_path"));
+		const auto OptionSchema = ReadSchema(OptionsSchema);
 		auto JobSchema = ReadSchema(TEXT(R"({"type":"object","properties":{"request_id":{"type":"string","minLength":1},"mesh_paths":{"type":"array","minItems":1,"uniqueItems":true,"items":{"type":"string"}},"profile_id":{"type":"string"},"options":{"type":"object"},"overrides":{"type":"object","additionalProperties":{"type":"object"}},"overwrite":{"type":"boolean","default":false}},"required":["request_id","mesh_paths"],"additionalProperties":false})"));
 		JobSchema->GetObjectField(TEXT("properties"))->SetObjectField(TEXT("options"), OptionSchema);
+		auto PreflightSchema = UnrealToolsRuntime::Clone(JobSchema);
+		PreflightSchema->SetArrayField(TEXT("required"), Strings({TEXT("mesh_paths")}));
+		Add(TEXT("fbx_exporter_preflight"), TEXT("Inspect ordered mesh_paths with common options, profile_id and per-mesh overrides. Reports output paths, errors and overwrite requirements without writing files."), PreflightSchema.ToSharedRef(), Preflight);
 		Add(TEXT("fbx_exporter_job_start"), TEXT("Persist and queue ordered exports. Returns a job_id before asset loading. Same request_id+request returns the existing job; changed request errors. First failed target stops later targets."), JobSchema, JobStart);
 		Add(TEXT("fbx_exporter_job_status"), TEXT("Query by job_id or request_id. success describes the lookup, state describes the actual job. Native GPU/FBX calls can delay replies."),
 			ReadSchema(TEXT(R"({"type":"object","properties":{"job_id":{"type":"string"},"request_id":{"type":"string"}},"oneOf":[{"required":["job_id"]},{"required":["request_id"]}],"additionalProperties":false})")), JobStatus);

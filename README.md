@@ -2,7 +2,7 @@
 
 Unreal Engine 프로젝트에서 재사용하는 Editor 플러그인을 보관하는 저장소입니다.
 
-각 플러그인은 독립 도킹 탭과 프리셋·단계 실행 큐를 제공합니다. MCP 설치·연결·Python 호출은 [MCP 통합 안내](MCP/README.md)에 있습니다. 플러그인 하나만 복사해도 독립적으로 설치할 수 있고, 함께 설치하면 `unreal_tools` 연결 하나에서 17개 도구를 사용합니다. 기존 CubeShot 5개·FBX 4개 호출의 기본 동작과 응답을 유지하며 API와 런타임 버전은 1.2.0입니다. 오류 코드는 동기·비동기 경로에서 공통으로 전달하며 이력 보존 범위 밖의 요청 ID는 새 요청으로 처리됩니다.
+각 플러그인은 독립 도킹 탭과 프리셋·단계 실행 큐를 제공합니다. MCP 설치·호출은 [MCP 통합 안내](MCP/README.md)에 있습니다. 플러그인 하나만 복사해도 독립 설치할 수 있고, 함께 설치하면 `unreal_tools` 연결에서 CubeShot 8개·FBX 7개, 총 15개 도구를 사용합니다. API와 Python 런타임 버전은 **2.0.0**입니다. 촬영·추출은 `job_start`로 접수하고 `job_status`로 조회합니다. 구형 단일 실행 호출·설정 이관·기록 보정은 지원하지 않습니다.
 
 ## 현재 플러그인
 
@@ -15,7 +15,7 @@ Unreal Engine 프로젝트에서 재사용하는 Editor 플러그인을 보관�
 
 - `Shared/Native/`: GUI와 MCP가 함께 사용하는 C++ 작업·프리셋·예약·복구·이력 런타임의 원본입니다.
 - `MCP/`: Python 연결·설치·호출 런타임과 실제 도구 catalogue 기반 문서 생성기를 관리합니다.
-- `Scripts/sync_runtime.py`: 두 원본을 각 독립 플러그인으로 배포합니다. `MCP/sync_runtime.py`는 기존 명령의 호환 진입점입니다.
+- `Scripts/sync_runtime.py`: 두 원본을 각 독립 플러그인으로 배포합니다.
 - 각 플러그인의 `Source/`: 해당 도구의 옵션·배치 계획·실행 서비스, Slate GUI, MCP 어댑터와 촬영/추출 구현을 관리합니다.
 
 GUI와 MCP는 같은 서비스와 작업 큐를 호출합니다. GUI는 선택·편집·확인·결과 표시를, MCP는 JSON/schema·스레드 전환·응답 포장을 담당합니다. GUI의 미리보기는 transient 출력용 별도 경로이며 저장 작업의 예약·기록을 생성하지 않습니다.
@@ -24,7 +24,7 @@ GUI와 MCP는 같은 서비스와 작업 큐를 호출합니다. GUI는 선택·
 
 ## Editor workspace
 
-두 도구는 행별 독립 옵션과 모듈 소유 workspace를 사용합니다. 기본 옵션 변경은 새 대상에만 반영하며, 기존 행은 명시적인 편집·프리셋·일괄 적용·초기화로 변경합니다. GUI는 확정한 행별 옵션 snapshot으로 기존 작업 서비스를 호출하고 MCP API와 저장 형식은 유지합니다.
+두 도구는 행별 독립 옵션과 모듈 소유 workspace를 사용합니다. 기본 옵션 변경은 새 대상에만 반영하며, 기존 행은 명시적인 편집·프리셋·일괄 적용·초기화로 변경합니다. GUI는 확정한 행별 옵션 snapshot으로 기존 작업 서비스를 호출하고 현재 배치 API와 저장 서비스에 전달합니다.
 
 `Shared/Native/UnrealToolsWorkspace.h`는 Unreal 없이 컴파일하는 상태 코어이며 `UnrealToolsWorkspaceController.h`는 JSON·프리셋·이력 서비스 어댑터입니다. 각 플러그인 controller와 Slate 표시 코드는 분리되어 있습니다. 공통 코드는 기존 동기화 명령으로 배포합니다.
 

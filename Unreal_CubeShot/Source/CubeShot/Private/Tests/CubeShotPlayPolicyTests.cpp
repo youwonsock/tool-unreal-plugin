@@ -94,9 +94,8 @@ namespace
                 Test->TestEqual(TEXT("Actual PIE/SIE mode"),static_cast<bool>(GEditor->bIsSimulatingInEditor),Mode==1);
                 const FString Label=Mode==0?TEXT("Actual PIE"):TEXT("Actual SIE");
                 auto Status=Structured(TEXT("cubeshot_status"),MakeShared<FJsonObject>());Test->TestTrue(Label+TEXT(" status marks playing"),GetBool(Status,TEXT("pie_running")));Test->TestFalse(Label+TEXT(" capture unavailable"),GetBool(Status,TEXT("capture_available")));
-                auto Args=MakeShared<FJsonObject>();Args->SetStringField(TEXT("mesh_path"),TEXT("/Engine/BasicShapes/Cube.Cube"));
+                auto Args=MakeShared<FJsonObject>();Args->SetArrayField(TEXT("mesh_paths"),Strings({TEXT("/Engine/BasicShapes/Cube.Cube")}));
                 auto Plan=Structured(TEXT("cubeshot_preflight"),Args);Test->TestFalse(Label+TEXT(" preflight rejected"),GetBool(Plan,TEXT("success")));Test->TestFalse(Label+TEXT(" cannot proceed"),GetBool(Plan,TEXT("can_proceed")));
-                auto Generate=Structured(TEXT("cubeshot_generate"),Args);Test->TestFalse(Label+TEXT(" legacy generation rejected"),GetBool(Generate,TEXT("success")));
                 const int32 Before=CubeShot::Service::Jobs().GetJobs().Num();auto Job=MakeShared<FJsonObject>();Job->SetStringField(TEXT("request_id"),FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));Job->SetArrayField(TEXT("mesh_paths"),{MakeShared<FJsonValueString>(TEXT("/Engine/BasicShapes/Cube.Cube"))});
                 auto Admission=Structured(TEXT("cubeshot_job_start"),Job);Test->TestFalse(Label+TEXT(" admission rejected"),GetBool(Admission,TEXT("success")));Test->TestEqual(Label+TEXT(" no job persisted"),CubeShot::Service::Jobs().GetJobs().Num(),Before);
                 GEditor->RequestEndPlayMap();Deadline=FPlatformTime::Seconds()+20;Phase=3;return false;

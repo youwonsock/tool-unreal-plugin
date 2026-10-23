@@ -51,7 +51,7 @@ class Session:
             if isinstance(response, Exception):
                 raise response
             return response
-        return Result(structuredContent={"success": True, **({"project_file": str(self.project), "api_version": "1.2.0",
+        return Result(structuredContent={"success": True, **({"project_file": str(self.project), "api_version": "2.0.0",
             "capabilities": ["profiles", "jobs", "extended_options", "batch_preflight", "png_overwrite",
                              "history_retention", "record_diagnostics"]} if name in self.statuses else {})})
 
@@ -79,9 +79,54 @@ class ClientTests(ProjectCase):
     def test_list_filters_native_tools_and_handles_pagination(self):
         self.session.paginate = True
         listed = self.run_calls([], True)[0]["tools"]
-        self.assertEqual(len(listed), 17)
+        self.assertEqual(len(listed), 15)
         self.assertNotIn("native_unrelated_tool", [tool["name"] for tool in listed])
         self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool, self.fbx.status_tool])
+
+    def test_disabled_old_provider_does_not_block_current_list_or_call(self):
+        originals = {provider.id: provider.manifest.read_text("utf-8") for provider in [self.cube, self.fbx]}
+        for current, disabled in [(self.cube, self.fbx), (self.fbx, self.cube)]:
+            current.manifest.write_text(originals[current.id], "utf-8")
+            older = json.loads(originals[disabled.id])
+            older.update(api_version="1.2.0", minimum_runtime_version="1.2.0")
+            disabled.manifest.write_text(json.dumps(older), "utf-8")
+            self.write_project({"Plugins": [{"Name": current.plugin, "Enabled": True},
+                                            {"Name": disabled.plugin, "Enabled": False}]})
+            for scope in [None, current.id]:
+                with self.subTest(current=current.id, scope=scope):
+                    self.session = Session(self.project, [current])
+                    listed = self.run_calls([], True, scope=scope)[0]["tools"]
+                    self.assertEqual({tool["name"] for tool in listed}, set(current.tools))
+                    query = {"tool": current.tools[1], "arguments": {"query": "Cube"}}
+                    self.assertFalse(client.failed(self.run_calls([query], scope=scope)[0]))
+                    self.assertEqual(self.session.calls, [(current.status_tool, {}), (current.status_tool, {}),
+                                                         (query["tool"], query["arguments"])])
+
+    def test_active_old_provider_is_rejected_before_connecting(self):
+        older = json.loads(self.fbx.manifest.read_text("utf-8"))
+        older.update(api_version="1.2.0", minimum_runtime_version="1.2.0")
+        self.fbx.manifest.write_text(json.dumps(older), "utf-8")
+        with self.assertRaisesRegex(ValueError, "major version 2"):
+            self.run_calls([{"tool": self.cube.status_tool}])
+        self.assertFalse(self.opened)
+
+    def test_disabled_retired_server_table_blocks_shared_and_scoped_calls_before_connecting(self):
+        originals = {provider.id: provider.manifest.read_text("utf-8") for provider in [self.cube, self.fbx]}
+        for current, disabled in [(self.cube, self.fbx), (self.fbx, self.cube)]:
+            current.manifest.write_text(originals[current.id], "utf-8")
+            disabled.manifest.write_text("{unreadable", "utf-8")
+            self.write_project({"Plugins": [{"Name": current.plugin, "Enabled": True},
+                                            {"Name": disabled.plugin, "Enabled": False}]})
+            original = server("unreal_tools", current.tools) + server(disabled.id, [disabled.id + "_retired_tool"])
+            path = self.write(".codex/config.toml", original)
+            for scope in [None, current.id]:
+                for list_tools in [False, True]:
+                    with self.subTest(current=current.id, scope=scope, list_tools=list_tools):
+                        with self.assertRaisesRegex(ValueError, "Provider-specific.*" + disabled.id):
+                            self.run_calls([] if list_tools else [{"tool": current.status_tool}], list_tools, scope=scope)
+                        self.assertFalse(self.opened)
+                        self.assertEqual(self.session.calls, [])
+                        self.assertEqual(path.read_text("utf-8"), original)
 
     def test_all_statuses_checked_before_mixed_batch_mutation(self):
         calls = [{"tool": self.cube.tools[3]}, {"tool": self.fbx.tools[3]}]
@@ -104,13 +149,27 @@ class ClientTests(ProjectCase):
             self.run_calls([{"tool": self.fbx.tools[3]}], scope=self.cube.id)
         self.assertFalse(self.opened)
 
+    def test_provider_specific_connection_is_not_used_as_a_fallback(self):
+        self.write(".codex/config.toml", server(self.cube.id, self.cube.tools))
+        with self.assertRaisesRegex(ValueError, "Provider-specific"):
+            self.run_calls([{"tool": self.cube.status_tool}])
+        self.assertFalse(self.opened)
+
+    def test_capability_maps_are_not_coerced_to_current_protocol_arrays(self):
+        self.session.responses[self.cube.status_tool] = Result(structuredContent={
+            "success": True, "project_file": str(self.project), "api_version": "2.0.0",
+            "capabilities": {"jobs": True}})
+        with self.assertRaises(client.FeatureUnavailableError):
+            self.run_calls([{"tool": self.cube.job_tools["start"]}])
+        self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
+
     def test_allowlist_and_disabled_tools_are_enforced_before_connecting(self):
         self.write(".codex/config.toml", server("unreal_tools", self.cube.tools, disabled_tools=[self.cube.tools[3]]))
         with self.assertRaises(ValueError):
             self.run_calls([{"tool": self.cube.tools[3]}])
         self.assertFalse(self.opened)
         listed = self.run_calls([], True)[0]["tools"]
-        self.assertEqual(len(listed), 8)
+        self.assertEqual(len(listed), 7)
         self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
 
     def test_status_exclusion_or_disabled_connection_blocks_work(self):
@@ -127,7 +186,7 @@ class ClientTests(ProjectCase):
                 self.run_calls([{"tool": self.cube.tools[3]}, invalid])
             self.assertFalse(self.opened)
 
-    def test_failed_result_stops_batch_and_preserves_legacy_result_contract(self):
+    def test_failed_result_stops_batch_and_preserves_result_contract(self):
         for error in (Result(isError=True), Result(structuredContent={"success": False})):
             self.session.calls.clear()
             self.session.responses[self.cube.tools[3]] = error
@@ -167,10 +226,8 @@ class ClientTests(ProjectCase):
         spec = importlib.util.spec_from_file_location("copied_cube_client", path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        results = self.quiet(asyncio.run, module.run_calls([{"tool": self.cube.status_tool}], project=self.project))
-        self.assertEqual(results[0]["structuredContent"]["project_file"], str(self.project))
+        self.assertEqual(self.quiet(module.main, ["--list-tools", "--project", str(self.project)]), 0)
         self.assertTrue((self.root / "Saved/CubeShot/MCPCalls").is_dir())
-        self.assertEqual(self.quiet(module.main, ["--list-tools"], default_project=self.project), 0)
 
     def test_evidence_failure_does_not_replace_success_or_original_error(self):
         with patch.object(Path, "write_text", side_effect=OSError("evidence denied")):
@@ -188,36 +245,23 @@ class ClientTests(ProjectCase):
             with self.assertRaisesRegex(RuntimeError, "actual transport failure"):
                 self.run_calls([{"tool": self.cube.tools[3]}])
 
-    def test_new_features_require_native_capabilities_but_old_calls_do_not(self):
-        self.session.responses[self.cube.status_tool] = Result(structuredContent={
-            "success": True, "project_file": str(self.project)})
-        self.run_calls([{"tool": self.cube.tools[3]}])
-        for tool, arguments in [(self.cube.job_tools["start"], {"mesh_paths": ["/Game/Cube.Cube"]}),
-                                (self.cube.tools[2], {"mesh_paths": ["/Game/Cube.Cube"]}),
-                                (self.cube.tools[3], {"background": "White"}),
-                                ("cubeshot_profiles", {"action": "list"})]:
-            self.session.calls.clear()
-            with self.assertRaises(client.FeatureUnavailableError):
-                self.run_calls([{"tool": tool, "arguments": arguments}])
-            self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
+    def test_all_calls_reject_missing_or_older_editor_versions(self):
+        for api in [None, "1.2.0", "3.0.0", "bad"]:
+            context = {"success": True, "project_file": str(self.project), "capabilities": []}
+            if api is not None:
+                context["api_version"] = api
+            self.session.responses[self.cube.status_tool] = Result(structuredContent=context)
+            for tool in [self.cube.status_tool, self.cube.tools[1], self.cube.job_tools["start"], "cubeshot_export_png"]:
+                self.session.calls.clear()
+                with self.assertRaises(client.FeatureUnavailableError):
+                    self.run_calls([{"tool": tool}])
+                self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
 
-    def test_every_new_capture_argument_is_guarded_against_legacy_editor(self):
-        self.session.responses[self.cube.status_tool] = Result(structuredContent={
-            "success": True, "project_file": str(self.project)})
-        new_arguments = {"background": "solid", "background_texture": "/Engine/Test.Test", "solid_color": [0, 0, 0, 1],
-                         "auto_fit": True, "camera_distance": 100, "field_of_view": 45, "ortho_width": 100,
-                         "profile_id": "item_icon", "export_png": True, "png_directions": ["Front"],
-                         "trim_transparent": True, "padding_pixels": 8, "quarter_turns": 1}
-        for tool in [self.cube.tools[2], self.cube.tools[3]]:
-            for field, value in new_arguments.items():
-                with self.subTest(tool=tool, field=field):
-                    self.session.calls.clear()
-                    with self.assertRaises(client.FeatureUnavailableError):
-                        self.run_calls([{"tool": tool, "arguments": {"mesh_path": "/Engine/BasicShapes/Cube.Cube", field: value}}])
-                    self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
-        legacy = self.run_calls([{"tool": "cubeshot_export_png", "arguments": {"texture_path": "/Game/CubeShot/Test.Test",
-                                  "trim_transparent": True, "padding_pixels": 8, "quarter_turns": 1}}])
-        self.assertTrue(legacy[0]["structuredContent"]["success"])
+    def test_retired_tools_are_rejected_before_connecting(self):
+        for tool in ["cubeshot_generate", "fbx_exporter_export"]:
+            with self.assertRaisesRegex(ValueError, "outside the allow list"):
+                self.run_calls([{"tool": tool, "arguments": {"mesh_path": "/Engine/BasicShapes/Cube.Cube"}}])
+            self.assertFalse(self.opened)
 
     def test_lost_start_response_queries_same_request_id_without_resubmitting(self):
         start, status = self.cube.job_tools["start"], self.cube.job_tools["status"]
@@ -247,7 +291,7 @@ class ClientTests(ProjectCase):
         start = self.cube.job_tools["start"]
         self.session.responses[start] = ConnectionError("lost")
         self.session.responses[self.cube.status_tool] = [
-            Result(structuredContent={"success": True, "project_file": str(self.project), "api_version": "1.2.0",
+            Result(structuredContent={"success": True, "project_file": str(self.project), "api_version": "2.0.0",
                                       "capabilities": ["jobs"]}),
             Result(structuredContent={"success": True, "project_file": str(self.root.parent / "Wrong.uproject")})]
         with self.assertRaises(client.ProjectIdentityError):
@@ -295,7 +339,7 @@ class ClientTests(ProjectCase):
     def test_wait_stops_on_project_or_capability_change_after_reconnection(self):
         status = self.cube.job_tools["status"]
         self.session.responses[status] = Result(structuredContent={"success": True, "job_id": "job", "state": "running"})
-        good = Result(structuredContent={"success": True, "project_file": str(self.project), "api_version": "1.2.0",
+        good = Result(structuredContent={"success": True, "project_file": str(self.project), "api_version": "2.0.0",
                                         "capabilities": ["jobs"]})
         for bad in [Result(structuredContent={"success": True, "project_file": str(self.root.parent / "Wrong.uproject")}),
                     Result(structuredContent={"success": True, "project_file": str(self.project), "api_version": "1.0.0"})]:
@@ -336,15 +380,15 @@ class ClientTests(ProjectCase):
         self.assertTrue(result[0]["structuredContent"]["success"])
         self.assertIn("MCP_REQUEST_ID=", output.getvalue())
 
-    def test_png_overwrite_requires_new_capability_but_legacy_call_does_not(self):
+    def test_png_export_always_requires_current_capability(self):
         self.session.responses[self.cube.status_tool] = Result(structuredContent={
-            "success": True, "project_file": str(self.project), "api_version": "1.1.0", "capabilities": []})
+            "success": True, "project_file": str(self.project), "api_version": "2.0.0", "capabilities": []})
         parameters = {"texture_path": "/Game/CubeShot/Test.Test"}
-        self.assertTrue(self.run_calls([{"tool": "cubeshot_export_png", "arguments": parameters}])[0]["structuredContent"]["success"])
-        self.session.calls.clear()
-        with self.assertRaises(client.FeatureUnavailableError):
-            self.run_calls([{"tool": "cubeshot_export_png", "arguments": {**parameters, "overwrite": False}}])
-        self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
+        for values in [parameters, {**parameters, "overwrite": False}]:
+            self.session.calls.clear()
+            with self.assertRaises(client.FeatureUnavailableError):
+                self.run_calls([{"tool": "cubeshot_export_png", "arguments": values}])
+            self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool])
         del self.session.responses[self.cube.status_tool]
         self.run_calls([{"tool": "cubeshot_export_png", "arguments": {**parameters, "overwrite": False}}])
         self.assertIs(self.session.calls[-1][1]["overwrite"], False)
@@ -363,3 +407,11 @@ class ClientTests(ProjectCase):
             "success": False, "error_code": "NOT_FOUND", "error": "Job record expired."})
         self.assertEqual(self.wait_cli(status, {"request_id": "expired-request"}), 1)
         self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool, status])
+
+    def test_wait_does_not_translate_old_job_envelopes_or_state_names(self):
+        status = self.cube.job_tools["status"]
+        for payload in [{"job": {"job_id": "old", "state": "succeeded"}}, {"status": "succeeded"}]:
+            self.session.calls.clear()
+            self.session.responses[status] = Result(structuredContent={"success": True, **payload})
+            self.assertEqual(self.wait_cli(status, {"job_id": "old"}), 1)
+            self.assertEqual([name for name, _ in self.session.calls], [self.cube.status_tool, status])

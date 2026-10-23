@@ -360,14 +360,6 @@ bool FCubeShotCaptureService::PrepareCaptureWork(const FCubeShotOptions& Options
     return PrepareCompositeWork(MoveTemp(RawFrame), Options, TargetResolution, OutWork, OutError);
 }
 
-bool FCubeShotCaptureService::CaptureAndComposite(const FCubeShotOptions& Options, ECubeShotDirection Direction,
-    int32 TargetResolution, FCubeShotImage& OutImage, FText& OutError)
-{
-    OutImage.Reset(); FCubeShotPixelWork Work;
-    if (!PrepareCaptureWork(Options, Direction, TargetResolution, Work, OutError)) return false;
-    return Work(OutImage, OutError);
-}
-
 void FCubeShotCaptureService::Shutdown()
 {
     bInitialized = false;

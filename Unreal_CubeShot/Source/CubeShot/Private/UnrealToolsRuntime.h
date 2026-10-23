@@ -421,9 +421,8 @@ public:
     virtual bool CanCancel() const = 0;
     virtual bool IsCommitPhase() const = 0;
     virtual FObject GetResult() const = 0;
-    // MAX_uint64 is the compatibility fallback: obtain and compare a fresh result.
-    // Production runners increment a cheap revision only when visible state changes.
-    virtual uint64 GetSnapshotRevision() const { return MAX_uint64; }
+    // Runners increment a cheap revision only when visible state changes.
+    virtual uint64 GetSnapshotRevision() const = 0;
     virtual void Shutdown() {}
 };
 
@@ -433,7 +432,6 @@ public:
     using FNormalize = TFunction<bool(FObject&, FString&)>;
     using FReserve = TFunction<TArray<FString>(const FItemSpec&)>;
     using FFactory = TFunction<TUniquePtr<IItemRunner>(const FItemSpec&, const FString&)>;
-    using FCompletion = TFunction<void(FObject)>;
     using FRecoveryAcknowledger = TFunction<bool(const FObject&, FString&)>;
     // Cheap editor policy only. Asset loading and full preflight remain runner stages.
     using FAdmissionValidator = TFunction<bool(const TArray<FItemSpec>&, FString&)>;
@@ -550,7 +548,7 @@ public:
         return false;
     }
 #if WITH_DEV_AUTOMATION_TESTS
-    void AdvanceOneStepForTesting() { Drive(false); }
+    void AdvanceOneStepForTesting(bool Synchronous = false) { Drive(Synchronous); }
     void AdvanceFrameForTesting() { ExecuteFrame(); }
     void AdvanceMaintenanceTickerForTesting() { Tick(0.0f); }
     void SetPersistGateForTesting(TFunction<bool(const FObject&, FString&)> Gate) { PersistGate = MoveTemp(Gate); }
@@ -785,19 +783,6 @@ public:
         if (GetString(Job, TEXT("error_code")) == TEXT("IO_ERROR")) { Result->SetBoolField(TEXT("success"), false); Result->SetStringField(TEXT("error"), GetString(Job, TEXT("error"))); Result->SetStringField(TEXT("error_code"), TEXT("IO_ERROR")); }
         return Result;
     }
-    FObject StartLegacyStructured(const FItemSpec& Spec, FCompletion Completion)
-    {
-        if (IsBusy() || bStopping) return Error(TEXT("A queued or active job is using this plugin."), TEXT("BUSY"));
-        FObject Accepted = Start(SingleRequest(Spec), Spec.ExecutionMode);
-        if (GetBool(Accepted, TEXT("success"))) Completions.Add(GetString(Accepted, TEXT("job_id")), MoveTemp(Completion));
-        return Accepted;
-    }
-    bool StartLegacy(const FItemSpec& Spec, FCompletion Completion, FString& OutError)
-    {
-        FObject Accepted = StartLegacyStructured(Spec, MoveTemp(Completion));
-        if (!GetBool(Accepted, TEXT("success"))) { OutError = GetString(Accepted, TEXT("error")); return false; }
-        return true;
-    }
     void Shutdown()
     {
         if (bStopping) return;
@@ -842,9 +827,7 @@ public:
             Remember(Job, RecordPaths.FindRef(Id));
         }
         if (Runner) { Runner->Shutdown(); Runner.Reset(); }
-        for (const FString& Id : Queue) Complete(Id);
         Queue.Reset();
-        Completions.Reset();
         OnChanged.Clear();
     }
 private:
@@ -882,7 +865,7 @@ private:
             if (GetBool(Job, TEXT("recovery_required")) != (Phase != TEXT("acknowledged"))) return Fail(TEXT("Diagnostic phase disagrees with recovery reservation."));
             return true;
         }
-        if (Job->HasField(TEXT("record_kind")) && GetString(Job, TEXT("record_kind")) != TEXT("job")) return Fail(TEXT("Unknown record_kind."));
+        if (GetString(Job, TEXT("record_kind")) != TEXT("job")) return Fail(TEXT("Unknown record_kind."));
         FGuid Guid; const FString RequestId = GetString(Job, TEXT("request_id"));
         FDateTime Created;
         if (!Id.StartsWith(Provider + TEXT("-")) || !FGuid::Parse(RequestId, Guid) || !Guid.IsValid() || GetString(Job, TEXT("request_hash")).Len() != 40 || !GetObject(Job, TEXT("request")) || !Date(GetString(Job, TEXT("created_at")), Created)) return Fail(TEXT("Invalid request identity or creation time."));
@@ -890,6 +873,11 @@ private:
         if (RequestHash(Request) != GetString(Job, TEXT("request_hash")) || GetString(Request, TEXT("request_id")) != Guid.ToString(EGuidFormats::DigitsWithHyphensLower)) return Fail(TEXT("Request snapshot/hash does not match."));
         const FString State = GetString(Job, TEXT("state"));
         if (State != TEXT("queued") && State != TEXT("running") && !Terminal(Job)) return Fail(TEXT("Invalid job state."));
+        if (Job->HasField(TEXT("finished_at_source")) || Job->HasField(TEXT("retention_time_untrusted")))
+            return Fail(TEXT("Unsupported completion metadata. Older records are not migrated."));
+        FDateTime Finished;
+        if (Terminal(Job) && (!Date(GetString(Job, TEXT("finished_at")), Finished) || Finished > FDateTime::UtcNow() + FTimespan::FromDays(1)))
+            return Fail(TEXT("A completed job requires a valid finished_at timestamp. Older records are not migrated."));
         for (const TCHAR* Key : {TEXT("cancel_requested"), TEXT("cancel_effective"), TEXT("recovery_required")}) if (!Job->HasTypedField<EJson::Boolean>(Key)) return Fail(TEXT("Invalid job control flags."));
         if (!Job->HasTypedField<EJson::Array>(TEXT("items")) || !Job->HasTypedField<EJson::Array>(TEXT("reserved_paths"))) return Fail(TEXT("items/reserved_paths must be arrays."));
         const auto Items = GetArray(Job, TEXT("items")); if (Items.IsEmpty()) return Fail(TEXT("Job contains no items."));
@@ -899,6 +887,8 @@ private:
             if (!Value || Value->Type != EJson::Object) return Fail(TEXT("Job item must be an object."));
             const FObject Item = Value->AsObject(); const FString ItemState = GetString(Item, TEXT("state"));
             if (!FPackageName::IsValidObjectPath(GetString(Item, TEXT("mesh_path"))) || !GetObject(Item, TEXT("options")) || !Item->HasTypedField<EJson::Boolean>(TEXT("overwrite")) || !Item->HasTypedField<EJson::String>(TEXT("stage"))) return Fail(TEXT("Invalid item fields."));
+            const FString ExecutionMode = GetString(Item, TEXT("execution_mode"));
+            if (ExecutionMode != TEXT("interactive") && ExecutionMode != TEXT("unattended")) return Fail(TEXT("Missing or invalid item execution_mode."));
             if (ItemState != TEXT("pending") && ItemState != TEXT("running") && ItemState != TEXT("succeeded") && ItemState != TEXT("failed") && ItemState != TEXT("cancelled") && ItemState != TEXT("interrupted") && ItemState != TEXT("skipped")) return Fail(TEXT("Invalid item state."));
             if ((Item->HasField(TEXT("result")) && !Item->HasTypedField<EJson::Object>(TEXT("result"))) || (Item->HasField(TEXT("commit_pending")) && !Item->HasTypedField<EJson::Boolean>(TEXT("commit_pending")))) return Fail(TEXT("Invalid item result/commit flag."));
         }
@@ -935,7 +925,7 @@ private:
         const FString Id = GetString(Job, TEXT("job_id")); if (Id.IsEmpty()) return;
         Records.Add(Id, Job); if (!Filename.IsEmpty()) RecordPaths.Add(Id, Filename);
         FObject Summary = MakeShared<FJsonObject>();
-        for (const TCHAR* Key : {TEXT("job_id"), TEXT("record_kind"), TEXT("provider_id"), TEXT("created_at"), TEXT("finished_at"), TEXT("state"), TEXT("stage"), TEXT("progress"), TEXT("recovery_required"), TEXT("cancel_requested"), TEXT("retention_time_untrusted"), TEXT("phase"), TEXT("source_path"), TEXT("source_kind"), TEXT("error"), TEXT("error_code"), TEXT("raw_path")})
+        for (const TCHAR* Key : {TEXT("job_id"), TEXT("record_kind"), TEXT("provider_id"), TEXT("created_at"), TEXT("finished_at"), TEXT("state"), TEXT("stage"), TEXT("progress"), TEXT("recovery_required"), TEXT("cancel_requested"), TEXT("phase"), TEXT("source_path"), TEXT("source_kind"), TEXT("error"), TEXT("error_code"), TEXT("raw_path")})
             if (Job->HasField(Key)) Summary->SetField(Key, Job->TryGetField(Key));
         Summary = Clone(Summary); Summary->SetBoolField(TEXT("archived"), Under(RecordPaths.FindRef(Id), Root / TEXT("Archive")));
         Summary->SetArrayField(TEXT("reserved_paths"), Strings({}));
@@ -1059,7 +1049,7 @@ private:
         for (const auto& Pair : Summaries)
         {
             const FObject& Record = Pair.Value;
-            if (!Terminal(Record) || GetBool(Record, TEXT("recovery_required")) || GetBool(Record, TEXT("retention_time_untrusted")) || Pins.Contains(Pair.Key)) continue;
+            if (!Terminal(Record) || GetBool(Record, TEXT("recovery_required")) || Pins.Contains(Pair.Key)) continue;
             if (GetString(Record, TEXT("record_kind")) == TEXT("diagnostic"))
             {
                 bool Dependent = false;
@@ -1094,7 +1084,7 @@ private:
         {
             const FMaintenanceTask Task = Maintenance[0]; Maintenance.RemoveAt(0);
             const FObject* Summary = Summaries.Find(Task.Id); const FString Source = RecordPaths.FindRef(Task.Id);
-            if (!Summary || Pins.Contains(Task.Id) || !Terminal(*Summary) || GetBool(*Summary, TEXT("recovery_required")) || GetBool(*Summary, TEXT("retention_time_untrusted")) ||
+            if (!Summary || Pins.Contains(Task.Id) || !Terminal(*Summary) || GetBool(*Summary, TEXT("recovery_required")) ||
                 !(Under(Source, Root) || Under(Source, StorageRoot / TEXT("Diagnostics")))) continue;
             bool ProtectedSource = false;
             for (const auto& Pair : Summaries)
@@ -1116,12 +1106,10 @@ private:
                 { Records.Remove(Task.Id); CacheOrder.Remove(Task.Id); RegisterRecordIssue(Source, Validation); continue; }
                 // Refresh the authority used by admission/status before reevaluating
                 // protection and rank. Never trust a cached pre-mutation summary.
-                FDateTime Finished;
-                if (Terminal(DiskRecord) && !Date(GetString(DiskRecord, TEXT("finished_at")), Finished)) DiskRecord->SetBoolField(TEXT("retention_time_untrusted"), true);
                 Remember(DiskRecord, Source);
                 Changed = true;
                 const FObject Fresh = Summaries[Task.Id];
-                if (!Terminal(Fresh) || GetBool(Fresh, TEXT("recovery_required")) || GetBool(Fresh, TEXT("retention_time_untrusted")) || Pins.Contains(Task.Id)) { Changed = true; continue; }
+                if (!Terminal(Fresh) || GetBool(Fresh, TEXT("recovery_required")) || Pins.Contains(Task.Id)) { Changed = true; continue; }
                 TArray<uint8> Rechecked;
                 if (!FFileHelper::LoadFileToArray(Rechecked, *Source) || BytesHash(Rechecked) != BytesHash(SourceBytes))
                 { Records.Remove(Task.Id); CacheOrder.Remove(Task.Id); RegisterRecordIssue(Source, TEXT("Record changed immediately before maintenance; review its current contents.")); continue; }
@@ -1143,7 +1131,7 @@ private:
             for (const auto& Pair : Summaries)
             {
                 const FObject& Other = Pair.Value;
-                if (Pair.Key == Task.Id || !Terminal(Other) || GetBool(Other, TEXT("recovery_required")) || GetBool(Other, TEXT("retention_time_untrusted")) || Pins.Contains(Pair.Key) ||
+                if (Pair.Key == Task.Id || !Terminal(Other) || GetBool(Other, TEXT("recovery_required")) || Pins.Contains(Pair.Key) ||
                     (GetString(Other, TEXT("record_kind")) == TEXT("diagnostic")) != IsDiagnostic) continue;
                 if (Newer(Pair.Key, Task.Id)) ++Rank;
             }
@@ -1216,7 +1204,6 @@ private:
         }
         for (const FString& Filename : Files)
         {
-            const FDateTime OriginalTime = IFileManager::Get().GetTimeStamp(*Filename);
             FString Text;
             if (!FFileHelper::LoadFileToString(Text, *Filename)) { RegisterRecordIssue(Filename, TEXT("Journal cannot be read.")); continue; }
             FObject Job = Parse(Text);
@@ -1246,15 +1233,6 @@ private:
                 }
                 bChanged = true;
             }
-            if (Terminal(Job) && !Job->HasField(TEXT("finished_at")))
-            {
-                if (OriginalTime.GetTicks() > 0 && OriginalTime <= FDateTime::UtcNow() + FTimespan::FromDays(1))
-                { Job->SetStringField(TEXT("finished_at"), OriginalTime.ToIso8601()); Job->SetStringField(TEXT("finished_at_source"), TEXT("legacy_file_mtime")); }
-                else Job->SetBoolField(TEXT("retention_time_untrusted"), true);
-                bChanged = true;
-            }
-            FDateTime Finished;
-            if (Terminal(Job) && (!Date(GetString(Job, TEXT("finished_at")), Finished) || Finished > FDateTime::UtcNow() + FTimespan::FromDays(1))) Job->SetBoolField(TEXT("retention_time_untrusted"), true);
             Remember(Job, Filename);
             if (bChanged)
             {
@@ -1280,7 +1258,7 @@ private:
     FObject RunnerSnapshot()
     {
         const uint64 Value = Runner->GetSnapshotRevision();
-        if (!CachedRunnerResult || Value == MAX_uint64 || Value != CachedRunnerRevision)
+        if (!CachedRunnerResult || Value != CachedRunnerRevision)
         {
             CachedRunnerResult = Clone(Runner->GetResult()); CachedRunnerRevision = Value;
             CachedRunnerResultHash = RequestHash(CachedRunnerResult);
@@ -1398,8 +1376,7 @@ private:
         if (!Persist(Job, Message))
         {
             Job->SetStringField(TEXT("state"), TEXT("failed")); Job->SetStringField(TEXT("error"), Message); Job->SetStringField(TEXT("error_code"), TEXT("IO_ERROR")); Job->SetBoolField(TEXT("recovery_required"), true);
-            // Preserve every native path while ensuring both inline and async legacy
-            // callers observe journal failure rather than native success.
+            // Preserve native output paths and report durable journal failures to all callers.
             for (const auto& Value : Items)
             {
                 FObject Item = Value->AsObject(); FObject Result = GetObject(Item, TEXT("result"));
@@ -1410,19 +1387,8 @@ private:
         }
         Remember(Job, RecordPaths.FindRef(Id)); bMaintenanceDue = true;
         Queue.Remove(Id);
-        Complete(Id);
         OnChanged.Broadcast();
         Evict();
-    }
-    void Complete(const FString& Id)
-    {
-        FCompletion Completion;
-        if (!Completions.RemoveAndCopyValue(Id, Completion)) return;
-        const auto Items = GetArray(Records[Id], TEXT("items"));
-        FObject Result = Items.IsEmpty() ? nullptr : GetObject(Items[0]->AsObject(), TEXT("result"));
-        if (!Result.IsValid() || !Result->HasField(TEXT("success"))) Result = Error(GetString(Records[Id], TEXT("error"), TEXT("Job interrupted.")), TEXT("EDITOR_INTERRUPTED"));
-        if (GetString(Records[Id], TEXT("error_code")) == TEXT("IO_ERROR")) { Result = Clone(Result); Result->SetBoolField(TEXT("success"), false); Result->SetStringField(TEXT("error_code"), TEXT("IO_ERROR")); Result->SetStringField(TEXT("error"), GetString(Records[Id], TEXT("error"))); }
-        Completion(Clone(Result));
     }
     struct FMaintenanceTask { FString Id; int32 Action = 0; };
     const uint64 InstanceGeneration = NextServiceInstanceGeneration();
@@ -1452,7 +1418,6 @@ private:
     int32 SnapshotBuilds = 0;
 #endif
     TMap<FString, FString> RequestIds;
-    TMap<FString, FCompletion> Completions;
     TArray<FString> Queue;
     TUniquePtr<IItemRunner> Runner;
     FDelegateHandle FrameDriver;

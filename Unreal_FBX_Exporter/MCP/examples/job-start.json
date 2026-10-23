@@ -1,0 +1,11 @@
+{
+  "tool": "fbx_exporter_job_start",
+  "arguments": {
+    "request_id": "c9df8a13-8e06-4113-9577-71ac963d513c",
+    "mesh_paths": [
+      "/Engine/BasicShapes/Cube.Cube"
+    ],
+    "options": {},
+    "overwrite": false
+  }
+}

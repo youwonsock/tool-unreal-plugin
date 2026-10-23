@@ -437,29 +437,6 @@ FObject InspectBatch(const FObject& Request, bool bAllowInteractiveCheckout)
 
 bool Resolve(const FObject& Request, FPreparedBatch& Batch, FString& Error) { return Jobs().PrepareBatch(Request,Batch,Error); }
 
-namespace
-{
-    bool ResolveGeneration(const FObject& Request,FItemSpec& Spec,FString& Message)
-    {
-        if(!Request||!Request->TryGetStringField(TEXT("mesh_path"),Spec.MeshPath)||!FPackageName::IsValidObjectPath(Spec.MeshPath))
-        {Message=TEXT("mesh_path must be an exact StaticMesh object path.");return false;}
-        Spec.Options=Clone(Request);Spec.Options->RemoveField(TEXT("mesh_path"));Spec.Options->RemoveField(TEXT("overwrite"));
-        if(!Normalize(Spec.Options,Message))return false;
-        if(Request->HasField(TEXT("overwrite"))&&!Request->TryGetBoolField(TEXT("overwrite"),Spec.bOverwrite))
-        {Message=TEXT("overwrite must be boolean.");return false;}
-        return true;
-    }
-}
-FObject GenerateInline(const FObject& Request)
-{
-    FItemSpec Spec;FString Message;if(!ResolveGeneration(Request,Spec,Message))return UnrealToolsRuntime::Error(Message,TEXT("invalid_argument"));
-    return Jobs().RunInline(Spec,Message);
-}
-FObject GenerateAsync(const FObject& Request,FJobService::FCompletion Completion)
-{
-    FItemSpec Spec;FString Message;if(!ResolveGeneration(Request,Spec,Message))return UnrealToolsRuntime::Error(Message,TEXT("invalid_argument"));
-    return Jobs().StartLegacyStructured(Spec,MoveTemp(Completion));
-}
 FObject Submit(const FObject& Request) { return Jobs().Start(Request); }
 
 bool CheckoutForSubmission(const FObject& Request, FText& Error,
@@ -504,7 +481,7 @@ FObject ExportPng(const FObject& Request)
     check(IsInGameThread());
     FString Message;
     if(!CheckFields(Request,{TEXT("texture_path"),TEXT("trim_transparent"),TEXT("padding_pixels"),TEXT("quarter_turns"),TEXT("overwrite")},Message))return UnrealToolsRuntime::Error(Message);
-    bool Trim=false,Overwrite=true;
+    bool Trim=false,Overwrite=false;
     for(const TCHAR* Key:{TEXT("trim_transparent"),TEXT("overwrite")})
         if(Request->HasField(Key)&&!Request->HasTypedField<EJson::Boolean>(Key))return UnrealToolsRuntime::Error(FString(Key)+TEXT(" must be boolean."));
     Request->TryGetBoolField(TEXT("trim_transparent"),Trim);Request->TryGetBoolField(TEXT("overwrite"),Overwrite);

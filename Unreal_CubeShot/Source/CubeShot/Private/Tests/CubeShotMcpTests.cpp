@@ -17,13 +17,14 @@ bool FCubeShotMcpContractTest::RunTest(const FString& Parameters)
 {
     IModelContextProtocolModule& Module = IModelContextProtocolModule::GetChecked();
     for (const TCHAR* Name : {TEXT("cubeshot_status"), TEXT("cubeshot_find_meshes"), TEXT("cubeshot_preflight"),
-        TEXT("cubeshot_generate"), TEXT("cubeshot_export_png"), TEXT("cubeshot_profiles"), TEXT("cubeshot_job_start"), TEXT("cubeshot_job_status"), TEXT("cubeshot_job_control")})
+        TEXT("cubeshot_export_png"), TEXT("cubeshot_profiles"), TEXT("cubeshot_job_start"), TEXT("cubeshot_job_status"), TEXT("cubeshot_job_control")})
     {
         const TSharedPtr<IModelContextProtocolTool> Tool = Module.FindTool(Name);
         if (!TestTrue(FString::Printf(TEXT("Tool %s registered"), Name), Tool.IsValid())) return false;
         TestEqual(TEXT("Schema is an object"), Tool->GetInputJsonSchema()->GetStringField(TEXT("type")), FString(TEXT("object")));
         TestTrue(TEXT("Output schema is published"), Tool->GetOutputJsonSchema().IsValid());
     }
+    TestFalse(TEXT("Retired generate tool is absent"), Module.FindTool(TEXT("cubeshot_generate")).IsValid());
     const TSharedPtr<IModelContextProtocolTool> Preflight = Module.FindTool(TEXT("cubeshot_preflight"));
     auto Rejects = [this, &Preflight](const TCHAR* Label, const TSharedRef<FJsonObject>& Args)
     {
@@ -34,21 +35,25 @@ bool FCubeShotMcpContractTest::RunTest(const FString& Parameters)
     TSharedRef<FJsonObject> Args = MakeShared<FJsonObject>();
     Rejects(TEXT("Missing mesh rejected without a write"), Args);
     Args->SetStringField(TEXT("mesh_path"), TEXT("/Engine/BasicShapes/Cube.Cube"));
-    Args->SetNumberField(TEXT("resolution"), 16);
+    Rejects(TEXT("Flat mesh_path requests are unsupported"), Args);
+    Args->RemoveField(TEXT("mesh_path"));
+    Args->SetArrayField(TEXT("mesh_paths"), UnrealToolsRuntime::Strings({TEXT("/Engine/BasicShapes/Cube.Cube")}));
+    auto Options = MakeShared<FJsonObject>(); Args->SetObjectField(TEXT("options"), Options);
+    Options->SetNumberField(TEXT("resolution"), 16);
     Rejects(TEXT("Undersized resolution rejected"), Args);
-    Args->SetNumberField(TEXT("resolution"), 512.5);
+    Options->SetNumberField(TEXT("resolution"), 512.5);
     Rejects(TEXT("Fractional resolution rejected"), Args);
-    Args->SetStringField(TEXT("resolution"), TEXT("512"));
+    Options->SetStringField(TEXT("resolution"), TEXT("512"));
     Rejects(TEXT("String resolution rejected"), Args);
-    Args->SetNumberField(TEXT("resolution"), 512);
-    Args->SetStringField(TEXT("projection"), TEXT("unknown"));
+    Options->SetNumberField(TEXT("resolution"), 512);
+    Options->SetStringField(TEXT("projection"), TEXT("unknown"));
     Rejects(TEXT("Unknown projection rejected"), Args);
-    Args->RemoveField(TEXT("projection"));
-    Args->SetStringField(TEXT("mesh_path"), TEXT("/Game/../Engine/BasicShapes/Cube.Cube"));
+    Options->RemoveField(TEXT("projection"));
+    Args->SetArrayField(TEXT("mesh_paths"), UnrealToolsRuntime::Strings({TEXT("/Game/../Engine/BasicShapes/Cube.Cube")}));
     Rejects(TEXT("Malformed asset path rejected"), Args);
     Args = MakeShared<FJsonObject>();
     Args->SetArrayField(TEXT("mesh_paths"), {MakeShared<FJsonValueString>(TEXT("/Engine/BasicShapes/Cube.Cube"))});
-    Args->SetStringField(TEXT("background"), TEXT("texture"));
+    Options = MakeShared<FJsonObject>(); Options->SetStringField(TEXT("background"), TEXT("texture")); Args->SetObjectField(TEXT("options"), Options);
     // A texture background without a texture path fails normalization without loading a fixture.
     const FModelContextProtocolToolResult BatchFailure = Preflight->Run(Args);
     const TSharedPtr<FJsonObject>* Structured;

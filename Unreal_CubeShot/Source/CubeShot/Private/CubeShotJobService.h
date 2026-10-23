@@ -20,8 +20,6 @@ namespace CubeShot::Service
     /** Shared application policy. Inspection does not write files or acquire output reservations. */
     UnrealToolsRuntime::FObject InspectBatch(const UnrealToolsRuntime::FObject& Request, bool bAllowInteractiveCheckout = false);
     bool Resolve(const UnrealToolsRuntime::FObject& Request, UnrealToolsRuntime::FPreparedBatch& Batch, FString& Error);
-    UnrealToolsRuntime::FObject GenerateInline(const UnrealToolsRuntime::FObject& Request);
-    UnrealToolsRuntime::FObject GenerateAsync(const UnrealToolsRuntime::FObject& Request, UnrealToolsRuntime::FJobService::FCompletion Completion);
     UnrealToolsRuntime::FObject Submit(const UnrealToolsRuntime::FObject& Request);
     bool CheckoutForSubmission(const UnrealToolsRuntime::FObject& Request, FText& Error,
         TFunction<bool(const TArray<UPackage*>&, FText&)> CheckoutCallback = {});

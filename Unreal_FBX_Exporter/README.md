@@ -81,9 +81,11 @@ MCP 도구 구현·등록·입력 검사는 이 플러그인 안에 있습니다
 | `fbx_exporter_status` | 현재 프로젝트, 출력 기본 경로, 실행 가능 여부 확인 |
 | `fbx_exporter_find_meshes` | 메시 이름 검색 및 정확한 에셋 경로 반환 |
 | `fbx_exporter_preflight` | LOD0/UV0·출력 경로·덮어쓰기 필요 여부 검사; 파일 생성 없음 |
-| `fbx_exporter_export` | 기존 추출 서비스로 FBX·선택 PNG·JSON 생성, 선택적으로 PNG 임베드 |
+| `fbx_exporter_job_start` | `request_id`와 `mesh_paths`로 FBX·선택 PNG·JSON 추출 접수 |
+| `fbx_exporter_job_status` / `fbx_exporter_job_control` | 조회·취소·복구 확인 |
+| `fbx_exporter_profiles` | 프리셋 조회·저장·삭제 |
 
-새 프로젝트에서는 Editor를 닫고 `python Plugins/FBX_Exporter/MCP/setup_mcp.py`를 실행합니다. 활성 MCP 플러그인을 검색해 `unreal_tools` 연결을 구성하며 FBX 최신 버전만 설치하면 8개, CubeShot 최신 버전도 설치하면 17개 도구를 제공합니다. 기본 주소는 `http://127.0.0.1:8000/mcp`입니다. Editor 재시작 후 Codex의 프로젝트 MCP 설정을 다시 로드합니다. [MCP 설치·호출 안내](MCP/README.md)에 이전·백업·CLI와 인자 예제가 있습니다.
+새 프로젝트에서는 Editor를 닫고 `python Plugins/FBX_Exporter/MCP/setup_mcp.py`를 실행합니다. 활성 MCP 플러그인을 검색해 `unreal_tools` 연결을 구성하며 FBX 2.0만 설치하면 7개, CubeShot 2.0도 설치하면 15개 도구를 제공합니다. 기본 주소는 `http://127.0.0.1:8000/mcp`입니다. Editor 재시작 후 Codex의 프로젝트 MCP 설정을 다시 로드합니다. [MCP 설치·호출 안내](MCP/README.md)에 설정·백업·CLI와 요청 예제가 있습니다.
 
 MCP 기본 출력은 **현재 프로젝트**의 `Saved/FBX_Exporter/Exports`입니다. `output_root`에 절대경로를 주면 변경할 수 있습니다. 해상도 기본값은 2048, 모든 맵 선택, 임베드 해제입니다. `maps: []`는 FBX만 생성합니다. 기존 메시 출력 폴더는 `overwrite: true`가 명시된 경우에만 사용자 파일까지 포함해 전체 교체됩니다. MCP는 확인창을 열지 않으며 결과의 `success`, `files`, `warnings`, `errors`를 반환합니다.
 
@@ -131,7 +133,7 @@ GPU 베이크와 FBX SDK 호출은 게임 스레드에서 수행되며 그 호�
 
 ## 검증
 
-`FBX_Exporter.Editor` Automation Tests는 파일명·Mask·맵 의존성·설정 이전·게시 복원·부분 백업 삭제 후 commit 보존·복원 실패 journal 차단/해제·sRGB ramp와 float HDR source·비활성 속성의 직접 재사용 거부·MCP 등록/스키마·엔진 Cube geometry 출력·덮어쓰기 보호를 검증합니다. 공통 작업 런타임 테스트는 접수 멱등성·취소·중단 복구·프리셋과 단계 실행 계약을 검증합니다. UI 상태 검증은 다중 선택·중복 유지·선택 대상 옵션 스냅샷·선택 제거 순서를 검증하며, 지연 MCP 등록 세대 검증은 unregister/re-register 이후 이전 요청이 EDITOR_INTERRUPTED로 한 번만 완료되는지 확인합니다. `Integration.GPUAndEmbeddedRoundTrip`은 임시 두 슬롯 메시에서 실제 GPU·Normal/Opacity/Mask/HDR 픽셀·선택 맵·FBX SDK 재import·임베드 PNG 바이트와 4096 처리를 검증하고 메모리 수치를 기록합니다. `Integration.WorkspaceScreenshots`는 실제 작업 공간을 사용하는 테스트 소유 창에서 두 화면 크기의 내용 PNG를 저장하며 최소 내용 크기를 검증합니다. 사용자 Editor 창의 크기를 바꾸지 않습니다.
+`FBX_Exporter.Editor` Automation Tests는 파일명·Mask·맵 의존성·현재 출력 설정 조회·게시 복원·부분 백업 삭제 후 commit 보존·복원 실패 journal 차단/해제·sRGB ramp와 float HDR source·비활성 속성의 직접 재사용 거부·MCP 등록/스키마·엔진 Cube geometry 출력·덮어쓰기 보호를 검증합니다. 공통 작업 런타임 테스트는 접수 멱등성·취소·중단 복구·프리셋과 단계 실행 계약을 검증합니다. UI 상태 검증은 다중 선택·중복 유지·선택 대상 옵션 스냅샷·선택 제거 순서를 검증하며, 지연 MCP 등록 세대 검증은 unregister/re-register 이후 이전 요청이 EDITOR_INTERRUPTED로 한 번만 완료되는지 확인합니다. `Integration.GPUAndEmbeddedRoundTrip`은 임시 두 슬롯 메시에서 실제 GPU·Normal/Opacity/Mask/HDR 픽셀·선택 맵·FBX SDK 재import·임베드 PNG 바이트와 4096 처리를 검증하고 메모리 수치를 기록합니다. `Integration.WorkspaceScreenshots`는 실제 작업 공간을 사용하는 테스트 소유 창에서 두 화면 크기의 내용 PNG를 저장하며 최소 내용 크기를 검증합니다. 사용자 Editor 창의 크기를 바꾸지 않습니다.
 
 Session Frontend의 Automation Tests에서 이 접두사를 실행할 수 있습니다. 렌더링 테스트와 GPU 베이크, 재import·임베드, 실제 독립 패키지 검증은 별도 테스트 프로젝트에서 수행하며, 수행 결과는 프로젝트 검증 기록에 남깁니다. 기능 설명 자체를 검증 실행 결과로 간주하지 않습니다.
 
@@ -166,3 +168,7 @@ Workspace는 플러그인 모듈이 현재 Editor 세션 동안 소유합니다.
 복구 진단 재조회와 진단 이력 페이지 전환은 controller 명령 하나로 처리합니다. 행의 수정 표시 `*`는 옵션 변경·초기화 후 기존 위젯에서 갱신합니다. 결과는 작업 ID와 작업 revision으로 최대 20개를 캐시하며, 다른 작업이 진행해도 선택한 과거 결과를 다시 조회·직렬화하지 않습니다. 명시적인 새로고침과 탭 재개방은 상태를 다시 확인합니다.
 
 작업 서비스가 재생성되면 주소·revision이 같아도 인스턴스 세대로 구분해 캐시와 표시 작업 pin을 새로 연결합니다. 갱신 전에 탭이나 모듈을 닫아도 이전 세대의 pin 해제가 새 서비스의 다른 관찰자 pin을 감소시키지 않습니다. 이 세대 번호는 작업 기록이나 MCP 응답에 저장하지 않습니다.
+
+## 2.0 레거시 제거
+
+MCP 검사와 접수는 `mesh_paths`, `options`, `overrides` 형식입니다. 이전 프로젝트 설정에서 출력 경로를 가져오지 않으며 현재 `/Script/FBX_Exporter.FBX_ExporterSettings`만 읽습니다. 구형 단일 추출 호출과 Python·설정·기록 변환 경로를 제거했습니다. 이전 완료 기록은 자동 보정하지 않고 미지원 형식이면 원본을 보존한 진단으로 표시합니다. 현재 Editor 빌드와 실제 출력 검증은 아직 실행하지 않았습니다.

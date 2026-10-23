@@ -23,54 +23,117 @@ class UpgradeTests(ProjectCase):
     def tools(self):
         return config.read_config(self.project)["mcp_servers"]["unreal_tools"]["enabled_tools"]
 
-    def test_exact_old_five_four_nine_tool_lists_upgrade_without_state(self):
-        old_cube, old_fbx = self.cube.compatible_tool_sets[0], self.fbx.compatible_tool_sets[0]
-        for text in [server("cubeshot", old_cube), server("fbx_exporter", old_fbx),
-                     server("unreal_tools", [*old_cube, *old_fbx]),
-                     server("cubeshot", old_cube) + server("fbx_exporter", old_fbx)]:
-            with self.subTest(text=text):
-                config.state_path(self.project).unlink(missing_ok=True)
-                self.write(".codex/config.toml", text)
-                self.assertEqual(self.install(), 0)
-                self.assertEqual(len(self.tools()), 17)
-                self.assertEqual(config.read_state(self.project)["enabled_tools"], self.tools())
+    def test_provider_specific_tables_are_rejected_without_migration(self):
+        for text in [server(self.cube.id, self.cube.tools), server(self.fbx.id, self.fbx.tools),
+                     server(self.cube.id, self.cube.tools) + server(self.fbx.id, self.fbx.tools)]:
+            path = self.write(".codex/config.toml", text)
+            self.assertEqual(self.install(), 1)
+            self.assertEqual(self.install("--replace-owned-config"), 1)
+            self.assertEqual(path.read_text("utf-8"), text)
+            self.assertFalse(config.state_path(self.project).exists())
+
+    def test_disabled_old_provider_tables_are_rejected_before_any_write(self):
+        originals = {provider.id: provider.manifest.read_text("utf-8") for provider in [self.cube, self.fbx]}
+        for current, disabled in [(self.cube, self.fbx), (self.fbx, self.cube)]:
+            current.manifest.write_text(originals[current.id], "utf-8")
+            older = json.loads(originals[disabled.id])
+            older.update(api_version="1.2.0", minimum_runtime_version="1.2.0")
+            for kind, source in [("1.2", json.dumps(older)), ("missing_version", json.dumps({"id": disabled.id})),
+                                 ("malformed", "{unreadable")]:
+                with self.subTest(current=current.id, manifest=kind):
+                    disabled.manifest.write_text(source, "utf-8")
+                    self.write_project({"Plugins": [{"Name": current.plugin, "Enabled": True},
+                                                    {"Name": disabled.plugin, "Enabled": False}]})
+                    self.assertEqual([provider.id for provider in registry.discover(self.project)], [current.id])
+                    original = server(disabled.id, [disabled.id + "_retired_tool"])
+                    path = self.write(".codex/config.toml", original)
+                    for args in [(), ("--dry-run",), ("--replace-owned-config",)]:
+                        for anchor in [MCP / "setup_mcp.py", current.manifest.with_name("setup_mcp.py")]:
+                            with self.subTest(args=args, anchor=anchor):
+                                self.assertEqual(self.quiet(config.main, ["--project", str(self.project), *args],
+                                                            anchor=anchor), 1)
+                                self.assertEqual(path.read_text("utf-8"), original)
+                                self.assertEqual(list(path.parent.iterdir()), [path])
+                                self.assertFalse((self.root / "Config").exists())
+                                self.assertFalse(config.state_path(self.project).exists())
+                    with self.assertRaisesRegex(ValueError, "Provider-specific.*" + disabled.id):
+                        config.prepare(self.project)
+
+    def test_disabled_provider_table_preserves_current_setup_until_manually_removed(self):
+        self.write_project({"Plugins": [{"Name": self.fbx.plugin, "Enabled": False}]})
+        self.fbx.manifest.write_text("{unreadable", "utf-8")
+        self.assertEqual(self.install(), 0)
+        path = self.root / ".codex/config.toml"
+        current = path.read_text("utf-8") + '[mcp_servers.unrelated]\ncommand="keep"\n'
+        path.write_text(current + server(self.fbx.id, ["fbx_exporter_export"]), "utf-8")
+        tracked = [path, config.state_path(self.project), self.root / "Config/DefaultEditorPerProjectUserSettings.ini"]
+        before = {target: target.read_bytes() for target in tracked}
+        backups = set(self.root.rglob("*.bak"))
+        for args in [(), ("--replace-owned-config",), ("--replace-owned-config", "--dry-run")]:
+            self.assertEqual(self.install(*args), 1)
+            self.assertEqual({target: target.read_bytes() for target in tracked}, before)
+            self.assertEqual(set(self.root.rglob("*.bak")), backups)
+        # Manual removal of only the retired table permits ordinary idempotent setup.
+        path.write_text(current, "utf-8")
+        self.assertEqual(self.install(), 0)
+        self.assertEqual(self.tools(), list(self.cube.tools))
+        self.assertEqual(config.read_config(self.project)["mcp_servers"]["unrelated"], {"command": "keep"})
+        self.assertEqual(config.prepare(self.project)[2], {})
+
+    def test_retired_server_detection_does_not_require_an_installed_provider(self):
+        shutil.rmtree(self.plugin_paths[self.fbx.id])
+        path = self.write(".codex/config.toml", server(self.fbx.id, ["fbx_exporter_export"]))
+        original = path.read_bytes()
+        self.assertEqual([provider.id for provider in registry.discover(self.project)], [self.cube.id])
+        self.assertEqual(self.install(), 1)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(config.state_path(self.project).exists())
+        self.assertFalse((self.root / "Config").exists())
 
     def test_generated_state_equality_is_required_when_it_exists(self):
         self.assertEqual(self.install(), 0)
         # Even a complete known old group must not override a later user edit.
-        path = self.write(".codex/config.toml", server("unreal_tools", self.cube.compatible_tool_sets[0]))
-        before = path.read_bytes()
-        self.assertEqual(self.install(), 1)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(len(config.read_state(self.project)["enabled_tools"]), 17)
-        self.assertEqual(self.install("--replace-owned-config"), 0)
-
-    def test_legacy_table_added_or_renamed_after_generated_setup_is_preserved(self):
-        self.assertEqual(self.install(), 0)
-        current = server("unreal_tools", self.tools())
-        for text in [server(self.cube.id, self.cube.compatible_tool_sets[0]),
-                     current + server(self.cube.id, self.cube.compatible_tool_sets[0])]:
-            path = self.write(".codex/config.toml", text)
-            before = path.read_bytes()
-            self.assertEqual(self.install(), 1)
-            self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(self.install("--replace-owned-config"), 0)
-
-    def test_removed_state_uses_only_declared_full_groups_and_keeps_user_limits(self):
-        self.assertEqual(self.install(), 0)
-        config.state_path(self.project).unlink()
-        self.assertEqual(self.install(), 0)
-        for extra in [{"disabled_tools": [self.cube.tools[-1]]}, {"enabled": False}]:
-            config.state_path(self.project).unlink(missing_ok=True)
-            path = self.write(".codex/config.toml", server("unreal_tools", self.tools(), **extra))
-            before = path.read_bytes()
-            self.assertEqual(self.install(), 1)
-            self.assertEqual(path.read_bytes(), before)
-        config.state_path(self.project).unlink(missing_ok=True)
         path = self.write(".codex/config.toml", server("unreal_tools", self.cube.tools[:2]))
         before = path.read_bytes()
         self.assertEqual(self.install(), 1)
         self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(config.read_state(self.project)["enabled_tools"]), 15)
+        self.assertEqual(self.install("--replace-owned-config"), 0)
+
+    def test_previous_setup_state_is_not_automatically_upgraded(self):
+        self.assertEqual(self.install(), 0)
+        current = config.read_state(self.project)
+        before = (self.root / ".codex/config.toml").read_bytes()
+        for api in [None, "1.2.0"]:
+            previous = {**current}
+            if api is None:
+                previous.pop("api_version")
+            else:
+                previous["api_version"] = api
+            source = json.dumps(previous)
+            config.state_path(self.project).write_text(source, "utf-8")
+            self.assertEqual(self.install(), 1)
+            self.assertEqual((self.root / ".codex/config.toml").read_bytes(), before)
+            self.assertEqual(config.state_path(self.project).read_text("utf-8"), source)
+        self.assertEqual(self.install("--replace-owned-config"), 0)
+        self.assertEqual(config.read_state(self.project)["api_version"], "2.0.0")
+
+    def test_provider_specific_table_is_not_merged_even_with_current_state(self):
+        self.assertEqual(self.install(), 0)
+        text = server("unreal_tools", self.tools()) + server(self.cube.id, self.cube.tools)
+        path = self.write(".codex/config.toml", text)
+        self.assertEqual(self.install(), 1)
+        self.assertEqual(self.install("--replace-owned-config"), 1)
+        self.assertEqual(path.read_text("utf-8"), text)
+
+    def test_missing_setup_state_never_infers_ownership(self):
+        self.assertEqual(self.install(), 0)
+        config.state_path(self.project).unlink()
+        path = self.root / ".codex/config.toml"
+        before = path.read_bytes()
+        self.assertEqual(self.install(), 1)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.install("--replace-owned-config"), 0)
 
     def test_timeout_changes_do_not_change_management_ownership(self):
         self.assertEqual(self.install(), 0)
@@ -178,21 +241,19 @@ class UpgradeTests(ProjectCase):
         self.assertEqual(order[-1], config.state_path(self.project))
         self.assertEqual(config.prepare(self.project)[2], {})
 
-    def test_legacy_manifest_defaults_and_insufficient_runtime_are_explicit(self):
-        data = json.loads(self.cube.manifest.read_text("utf-8"))
-        old = {key: data[key] for key in ["schema_version", "id", "plugin", "status_tool", "tools"]}
-        old["tools"] = list(self.cube.compatible_tool_sets[0])
-        self.cube.manifest.write_text(json.dumps(old), "utf-8")
-        provider = registry.read_manifest(self.cube.manifest)
-        self.assertEqual(provider.api_version, "1.0.0")
-        self.assertEqual(provider.job_tools, {})
-        with patch.object(registry, "__version__", "1.0.0"):
-            with self.assertRaisesRegex(RuntimeError, "new Python process"):
-                registry.active_providers(self.project)
-        # A disabled newer plugin does not impose runtime requirements.
-        self.write_project({"Plugins": [{"Name": "FBX_Exporter", "Enabled": False}]})
-        with patch.object(registry, "__version__", "1.0.0"):
-            self.assertEqual(len(registry.active_providers(self.project)[1]), 1)
+    def test_old_manifests_and_incompatible_runtime_are_rejected(self):
+        original = self.cube.manifest.read_text("utf-8")
+        data = json.loads(original)
+        for older in [{key: data[key] for key in ["schema_version", "id", "plugin", "status_tool", "tools"]},
+                      {**data, "api_version": "1.2.0", "minimum_runtime_version": "1.2.0"}]:
+            self.cube.manifest.write_text(json.dumps(older), "utf-8")
+            with self.assertRaises(ValueError):
+                registry.read_manifest(self.cube.manifest)
+        self.cube.manifest.write_text(original, "utf-8")
+        for runtime in ["1.2.0", "3.0.0"]:
+            with patch.object(registry, "__version__", runtime):
+                with self.assertRaisesRegex(RuntimeError, "new Python process"):
+                    registry.active_providers(self.project)
 
     def test_new_entrypoints_reject_old_already_loaded_package(self):
         for name in ["call_mcp.py", "setup_mcp.py"]:
@@ -203,12 +264,11 @@ class UpgradeTests(ProjectCase):
                 with self.assertRaisesRegex(RuntimeError, "new Python process"):
                     spec.loader.exec_module(module)
 
-    def test_manifest_role_version_and_compatibility_validation(self):
+    def test_manifest_role_version_and_capability_validation(self):
         original = json.loads(self.cube.manifest.read_text("utf-8"))
         for change in [{"api_version": "1.1"}, {"minimum_runtime_version": "next"},
                        {"job_tools": {"start": "other_tool"}}, {"job_tools": {"remove": self.cube.tools[1]}},
-                       {"compatible_tool_sets": [[self.cube.tools[0], self.cube.tools[0]]]},
-                       {"compatible_tool_sets": [["unknown"]]}, {"capabilities": [True]}]:
+                       {"job_tools": {}}, {"capabilities": [True]}]:
             self.cube.manifest.write_text(json.dumps({**original, **change}), "utf-8")
             with self.assertRaises(ValueError):
                 registry.read_manifest(self.cube.manifest)

@@ -60,7 +60,7 @@ bool FFBXExporterBatchPlanTest::RunTest(const FString&)
 	Request->RemoveField(TEXT("overrides"));
 	const auto Tool = IModelContextProtocolModule::GetChecked().FindTool(TEXT("fbx_exporter_preflight"));
 	if (!TestTrue(TEXT("MCP adapter registered"), Tool.IsValid())) return false;
-	auto Wire = Clone(FBXExporter::OptionsToJson(Options)); Wire->SetArrayField(TEXT("mesh_paths"), Strings({Parent->GetPathName(), Sibling->GetPathName()}));
+	auto Wire = MakeShared<FJsonObject>(); Wire->SetObjectField(TEXT("options"), FBXExporter::OptionsToJson(Options)); Wire->SetArrayField(TEXT("mesh_paths"), Strings({Parent->GetPathName(), Sibling->GetPathName()}));
 	const auto Response = Tool->Run(Wire).JsonObject->GetObjectField(TEXT("structuredContent"));
 	const auto Items = GetArray(Response, TEXT("items"));
 	TestEqual(TEXT("GUI-core and MCP keep target count"), Items.Num(), SiblingPlan.Items.Num());

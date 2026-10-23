@@ -99,3 +99,7 @@ Workspace는 플러그인 모듈이 현재 Editor 세션 동안 소유합니다.
 작업 서비스가 재생성되면 주소·revision이 같아도 인스턴스 세대로 구분해 캐시와 표시 작업 pin을 새로 연결합니다. 갱신 전에 탭이나 모듈을 닫아도 이전 세대의 pin 해제가 새 서비스의 다른 관찰자 pin을 감소시키지 않습니다. 이 세대 번호는 작업 기록이나 MCP 응답에 저장하지 않습니다.
 
 현재 변경의 검증 범위와 Unreal 후속 확인 항목은 [workspace 검증 기록](../MCP/WORKSPACE_VALIDATION.md)에 있습니다.
+
+## 2.0 레거시 제거
+
+MCP 도구는 8개이며 촬영은 `cubeshot_job_start`로 접수합니다. 검사는 `mesh_paths`, `options`, `overrides`를 사용합니다. 단독 PNG 내보내기도 기본 `overwrite=false`이며 기존 파일 교체에는 명시적인 `true`가 필요합니다. 구형 단일 촬영 호출, 이전 Python 호출 어댑터와 설정·기록 변환 경로를 제거했습니다. ViewModel은 미리보기·표시 검증만 담당하며 저장 실행 판단은 controller에서 수행합니다. 현재 Editor 빌드·GPU 출력 검증은 아직 실행하지 않았습니다.

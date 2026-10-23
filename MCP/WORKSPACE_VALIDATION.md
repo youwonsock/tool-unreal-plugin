@@ -3,6 +3,8 @@
 기준 저장소: `tool-unreal-plugin`, 시작 커밋 `64f7def`.
 이 기록은 현재 workspace 변경에 대한 검증입니다. [기존 검증 기록](VALIDATION.md)의 2026-10-16 Win64 실행 결과를 현재 코드의 실행 결과로 승계하지 않습니다.
 
+아래 workspace 분리 기록은 `1168a18`까지의 변경입니다. 이후 사용자 요청으로 구형 MCP·설정·기록 호환도 제거했으며, 현재 API 2.0의 변경과 검증 범위는 문서 끝의 별도 항목에 기록합니다. 아래의 API 유지 설명과 Python 68개 결과는 workspace 분리 당시 기준입니다.
+
 ## 변경 내용
 
 - 공통 `TModel`은 행별 독립 옵션, 기본 편집/행 편집, 체크 선택, 순서, 입력 세대, 유효성, 분리된 실행 snapshot을 관리합니다.
@@ -84,3 +86,49 @@ Unreal이 설치되어 있지 않아 Editor 타깃 빌드와 아래 Automation �
 10. 두 `Editor.Runtime.WorkspaceServiceGeneration` 검사를 실행해 동일 주소·동일 revision의 재생성에서 캐시와 pin이 새 세대로 연결되는지 확인합니다. 실제 MCP 재등록 전후의 탭 표시·pin 수명도 확인합니다.
 
 이번 변경의 완료 범위는 구현, 독립 코어·Python·배포 검사와 소스 검토입니다. Unreal 빌드·GUI·렌더링·최종 출력 검증은 위 후속 항목으로 남습니다.
+
+## API 2.0 레거시 제거 — 2026-10-24
+
+사용자가 구형 MCP 호출·설정 업그레이드·기록 호환까지 제거하는 범위를 선택했습니다. 기준 커밋은 `1168a18`이며, 현재 촬영·추출 실행기와 workspace controller는 유지합니다.
+
+- `cubeshot_generate`, `fbx_exporter_export`와 완료까지 대기하던 비동기 어댑터·완료 콜백 저장소를 제거했습니다. 촬영·추출은 `job_start`/`job_status`/`job_control`을 사용합니다. 내부 C++의 unattended 출력 경로는 현재 네이티브 출력 검사에도 사용하므로 유지합니다.
+- preflight는 `mesh_paths`·`options`·`profile_id`·`overrides` 형태의 배치 요청만 받습니다. 한 대상도 배열로 전달하며 단일 결과를 최상위로 펼치지 않습니다. 구형 `mesh_path` 및 최상위 옵션 입력은 거부합니다.
+- API·런타임·두 플러그인 버전은 `2.0.0`입니다. 현재 등록 도구는 CubeShot 8개·FBX 7개입니다. 독립 PNG는 기본 `overwrite=false`이며 기존 PNG 교체에는 명시적인 true가 필요합니다.
+- provider별 MCP 설정 병합, 이전 도구 목록 추정, manifest 기본 버전 추정, capabilities 객체 변환, 이전 작업 응답 envelope/state 이름 변환을 제거했습니다. 현재 생성 상태에는 API 버전을 명시합니다. 이전 개별 서버 테이블은 자동 변경하지 않으며, 통합 설정·상태의 재구성에는 명시적인 `--replace-owned-config`가 필요합니다.
+- `MCP/sync_runtime.py`, `cubeshot_common.py`, CLI의 이전 `run_calls`/`default_project` 어댑터, 인자만 담는 export 예제를 제거했습니다. 테스트는 `Scripts/sync_runtime.py`를 직접 가져옵니다. 새로운 요청 예제는 `examples/job-start.json`입니다.
+- Haven/AssetImportProject 출력 경로 이관과 전용 테스트 접근자를 제거했습니다. 현재 FBX 설정만 읽으며 읽기 과정에서 설정을 저장하지 않습니다. 현재 설정 조회 테스트로 대체했습니다.
+- 완료 시각을 파일 수정 시각에서 생성하는 기록 보정을 제거했습니다. 현재 필드·완료 시각·실행 모드가 맞지 않는 기록은 진단으로 남기고 원문을 보존합니다. 이전 변환 메타데이터도 지원하지 않습니다. 보존·정리 단계에서 다시 읽고 검사하는 보호는 유지합니다.
+- 미사용 UI/촬영 wrapper와 FBX 대화상자 wrapper, ViewModel의 별도 revision·변경 종류·실행 허용 상태와 중복 초기값을 제거했습니다. ViewModel은 표시 검증을 수행하며 실행 판단과 미리보기 예약 번호는 기존 controller/Slate 경로를 사용합니다. runner의 snapshot revision 제공은 필수 계약으로 바꿨습니다.
+- API 1.x의 `tool-spec.json`/`TOOL_REFERENCE.md` 캡처를 제거했습니다. 실제 API 2.0 Editor catalogue가 생긴 뒤 다시 생성해야 합니다. 문서 생성기는 manifest에 없는 provider 도구가 섞인 구형 catalogue를 거부합니다.
+
+현재 코드에서 실행한 검사:
+
+| 검사 | 결과 |
+|---|---|
+| `python3 Scripts/test_workspace.py` | 원본·두 배포본에서 각각 상태 코어 25개 + 세대 할당기 9개 통과, Slate 2개 소유권 정적 검사 통과 |
+| `python3 -m unittest discover -s MCP/tests -q` | 75개 통과 |
+| `python3 -m unittest discover -s Unreal_CubeShot/MCP/tests -q` | 1개 통과 |
+| `python3 Scripts/sync_runtime.py --check` | provider 2개·native 파일 5개 일치 |
+| `git diff --check` | 통과 |
+
+Python에는 구형 도구 접수 전 차단, 구형 설정·상태·manifest의 자동 이전 거부, API·capabilities 검증, 현재 설정의 재설치·백업·rollback, 독립 설치와 현재 예제 검사를 포함합니다. C++ 도구 등록 목록·manifest·버전 일치는 정적으로 확인합니다. Python 호출은 모의 전송이며 실제 Editor API 2.0을 실행한 결과가 아닙니다.
+
+Editor에서 남은 검사: 두 플러그인 빌드, 8개/7개 실제 등록과 새 preflight schema, 현재 job_start 기반 geometry 내보내기, PNG 기본 보호/명시적 덮어쓰기, 현재 FBX 설정 읽기, 미지원 기록의 진단·원문 보존·수동 확인, 변경한 runner revision·프레임 구동·저장 실패 검사를 실행해야 합니다. 앞서 작성한 동일 주소·동일 revision 서비스 교체의 캐시·pin 검사와 실제 Slate·GPU·Texture2D/PNG/FBX·UAT 검증도 계속 미실행입니다. 실제 catalogue 문서 재생성도 이 단계에서 수행합니다.
+
+### 비활성 구버전 검색 회귀 수정 — 2026-10-24
+
+- 검색은 `.uproject`·플러그인·모듈의 활성 여부와 현재 플랫폼/Editor 타깃 조건을 먼저 검사합니다. 제외된 플러그인의 manifest는 읽지 않으며 활성 플러그인만 중복·API 검증과 도구 목록에 참여합니다. 활성 구버전에 대한 엄격한 API 2 거부는 유지합니다.
+- descriptor의 `WhitelistPlatforms/Targets`, `BlacklistPlatforms/Targets` fallback을 제거했습니다. 현재 `PlatformAllowList/DenyList`, `TargetAllowList/DenyList`, `SupportedTargetPlatforms` 판정은 유지합니다. 원본과 두 플러그인 배포본에 동기화했습니다.
+- 새 Python 테스트 7개를 추가했습니다. CubeShot/FBX를 번갈아 활성화해 비활성 1.2 및 API 버전 누락 manifest와 함께 설정·재설치·목록·모의 호출이 되는지, 활성 구버전은 파일 변경·연결 전에 거부되는지 확인합니다. 플랫폼·타깃·기본 비활성화로 제외한 읽을 수 없는 manifest도 검사합니다. 현재 descriptor 필터와 구형 키 무시를 검증하며, 복사한 두 플러그인의 setup을 저장소 밖 별도 `python -S` 프로세스에서 실행합니다.
+- 수정 전 새 설정/descriptor 테스트가 실패하는 것을 확인했고, 수정 후 공통 Python **82개**, CubeShot 독립 설치 smoke **1개**가 통과했습니다. MCP 호출은 모의 전송이며 실제 Editor 서버에 연결하지 않았습니다.
+- `python3 Scripts/test_workspace.py`는 원본·두 배포본 각각 상태 코어 25개와 서비스 세대 9개, Slate 소유권 정적 검사 2개를 통과했습니다. `python3 Scripts/sync_runtime.py --check`와 `git diff --check`도 통과했습니다.
+- Editor 빌드·Automation·실제 MCP catalogue·Slate/GPU/출력 검증은 위 목록대로 미실행입니다. 이번 수정은 Python 검색과 descriptor 판정에 한정하며 이 결과를 Unreal 어댑터 검증으로 간주하지 않습니다.
+
+### 비활성 provider의 구형 서버 설정 감지 분리 — 2026-10-24
+
+- 비활성·필터 제외 플러그인의 manifest를 읽거나 검증하지 않는 검색 규칙을 유지했습니다. 설정 계층에 과거 서버 이름 `cubeshot`·`fbx_exporter`의 금지 목록을 두어 활성 provider 목록에 의존하지 않고 구형 테이블을 감지합니다. 현재 도구·provider 검색은 기존 manifest 규칙을 계속 사용합니다.
+- 플러그인이 비활성화되거나 제거되어도 구형 서버 테이블이 있으면 setup은 파일 변경 전에, 공통/플러그인 CLI는 연결 전에 이름을 표시하고 거부합니다. 자동 삭제·병합·이관은 없으며 `--dry-run`·`--replace-owned-config`도 감지를 우회하지 않습니다. 구형 테이블을 직접 제거한 뒤 현재 통합 설정의 재실행과 다른 서버 보존은 정상 동작합니다.
+- 회귀 테스트 5개를 추가했습니다. 두 플러그인을 번갈아 활성화해 비활성 1.2·버전 누락·손상 manifest와 구형 서버 테이블의 조합, 기존 통합 설정·상태·INI·백업 보존, 플러그인 제거 후 감지, 공통/개별 CLI의 연결 전 거부를 검사합니다. 두 독립 복사본의 setup도 저장소 밖 별도 `python -S` 프로세스로 확인합니다.
+- 수정 전 새 설정 테스트가 실패하는 것을 확인했습니다. 수정 후 공통 Python **87개**와 CubeShot 독립 설치 smoke **1개**가 통과했습니다. MCP 전송은 모의 세션이며 실제 Editor 연결 결과가 아닙니다.
+- 독립 C++ 상태 코어 25개·서비스 세대 9개는 원본과 두 배포본 각각 통과했고 Slate 소유권 정적 검사 2개도 통과했습니다. `python3 Scripts/sync_runtime.py --check`와 `git diff --check`를 통과했으며, 두 배포본의 설정 감지 코드가 원본과 일치합니다.
+- 이번 수정은 Python 설정 감지에 한정합니다. Editor 빌드·Native Automation·실제 MCP 등록/호출·Slate·캐시/pin 수명·GPU·Texture2D/PNG/FBX·UAT 검증은 계속 미실행입니다.

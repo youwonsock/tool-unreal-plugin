@@ -181,7 +181,6 @@ bool AcknowledgeJobRecovery(const UnrealToolsRuntime::FObject& Job, FString& Err
 }
 
 void ShutdownJobs() { if (RecoveryScanHandle.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(RecoveryScanHandle); RecoveryScanHandle.Reset(); CancelRecoveryDiagnostics(); bRecoveryDiagnosticsReady = false; bRecoveryScanActive = false; RecoveryRefreshElapsed = 0; if (JobService) JobService->Shutdown(); JobService.Reset(); ProfileStore.Reset(); }
-bool AreJobsInitialized() { return JobService.IsValid(); }
 bool AreRecoveryDiagnosticsReady() { return bRecoveryDiagnosticsReady; }
 void RefreshRecoveryDiagnostics() { InitializeJobs(); RegisterRecoveryDiagnostics(); bRecoveryScanActive = true; bRecoveryDiagnosticsReady = false; JobService->OnChanged.Broadcast(); }
 UnrealToolsRuntime::FProfileStore& Profiles() { InitializeJobs(); return *ProfileStore; }

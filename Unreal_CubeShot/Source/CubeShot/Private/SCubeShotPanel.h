@@ -130,7 +130,6 @@ private:
     TSharedRef<SWidget> BuildWorkflowPanel();
     TSharedRef<SWidget> BuildResultsPanel();
     void RebuildTargets();
-    TSharedPtr<FJsonObject> CurrentOptionsJson() const;
     void PersistCurrentOptions();
     void ApplyOptionsToSelected();
     void RemoveSelectedTargets();

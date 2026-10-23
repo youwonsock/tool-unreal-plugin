@@ -94,7 +94,7 @@ bool FCubeShotPngAtomicTest::RunTest(const FString&)
     FImage Image;Image.Init(2,2,ERawImageFormat::BGRA8,EGammaSpace::sRGB);FColor* Pixels=reinterpret_cast<FColor*>(Image.RawData.GetData());for(int32 Index=0;Index<4;++Index)Pixels[Index]=FColor(12,34,56,78);
     FText Error;TestTrue(TEXT("Initial PNG saved"),CubeShot::Image::SavePngAtomic(Filename,Image,false,Error));TArray<uint8> Before;FFileHelper::LoadFileToArray(Before,*Filename);
     Pixels[0]=FColor::Red;TestFalse(TEXT("No overwrite approval rejects replacement"),CubeShot::Image::SavePngAtomic(Filename,Image,false,Error));TArray<uint8> After;FFileHelper::LoadFileToArray(After,*Filename);TestTrue(TEXT("Existing PNG byte-for-byte preserved"),Before==After);
-    TestTrue(TEXT("Legacy approved replacement works"),CubeShot::Image::SavePngAtomic(Filename,Image,true,Error));FImage Loaded;TestTrue(TEXT("Replacement decodes"),FImageUtils::LoadImage(*Filename,Loaded));FImage Converted;Loaded.CopyTo(Converted,ERawImageFormat::BGRA8,EGammaSpace::sRGB);TestEqual(TEXT("Pixels preserved"),reinterpret_cast<const FColor*>(Converted.RawData.GetData())[0],FColor::Red);
+    TestTrue(TEXT("Explicitly approved replacement works"),CubeShot::Image::SavePngAtomic(Filename,Image,true,Error));FImage Loaded;TestTrue(TEXT("Replacement decodes"),FImageUtils::LoadImage(*Filename,Loaded));FImage Converted;Loaded.CopyTo(Converted,ERawImageFormat::BGRA8,EGammaSpace::sRGB);TestEqual(TEXT("Pixels preserved"),reinterpret_cast<const FColor*>(Converted.RawData.GetData())[0],FColor::Red);
     IFileManager::Get().DeleteDirectory(*Directory,false,true);return true;
 }
 
@@ -186,7 +186,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FCubeShotOptionsParityTest,"CubeShot.Editor.MCP
 bool FCubeShotOptionsParityTest::RunTest(const FString&)
 {
     auto Options=CubeShot::Service::DefaultOptions();FString Error;
-    TestTrue(TEXT("Legacy defaults valid"),CubeShot::Service::Normalize(Options,Error));TestEqual(TEXT("Legacy resolution"),Options->GetIntegerField(TEXT("resolution")),512);TestEqual(TEXT("Legacy projection"),Options->GetStringField(TEXT("projection")),FString(TEXT("orthographic")));
+    TestTrue(TEXT("API defaults valid"),CubeShot::Service::Normalize(Options,Error));TestEqual(TEXT("API default resolution"),Options->GetIntegerField(TEXT("resolution")),512);TestEqual(TEXT("API default projection"),Options->GetStringField(TEXT("projection")),FString(TEXT("orthographic")));
     Options->SetNumberField(TEXT("resolution"),257);Options->SetStringField(TEXT("background"),TEXT("solid"));TestTrue(TEXT("NPOT and solid accepted"),CubeShot::Service::Normalize(Options,Error));
     Options->SetNumberField(TEXT("field_of_view"),171);TestFalse(TEXT("Invalid FOV rejected"),CubeShot::Service::Normalize(Options,Error));Options->SetNumberField(TEXT("field_of_view"),45);Options->SetBoolField(TEXT("overwrite"),true);TestFalse(TEXT("Overwrite excluded from stored options"),CubeShot::Service::Normalize(Options,Error));return true;
 }

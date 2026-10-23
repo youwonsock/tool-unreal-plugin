@@ -617,7 +617,7 @@ EActiveTimerReturnType SCubeShotPanel::TickPreview(const double CurrentTime, con
     ViewModel->SetGenerating(Busy);
     if (bWasJobBusy && !Busy)
     {
-        ViewModel->RequestPreviewRecapture();
+        ViewModel->Validate();
         SchedulePreview(FCubeShotViewModel::EChangeKind::Recapture);
     }
     bWasJobBusy = Busy;
@@ -966,10 +966,6 @@ void SCubeShotPanel::LoadEditor()
     RebuildTargets();
     bLoadingTarget = false;
     SchedulePreview(FCubeShotViewModel::EChangeKind::Recapture);
-}
-TSharedPtr<FJsonObject> SCubeShotPanel::CurrentOptionsJson() const
-{
-    return Workspace->CopyActiveOptions();
 }
 void SCubeShotPanel::PersistCurrentOptions()
 {

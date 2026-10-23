@@ -73,32 +73,6 @@ namespace
 		return Data;
 	}
 
-	constexpr TCHAR ConfigSection[] = TEXT("/Script/FBX_Exporter.FBX_ExporterSettings");
-	constexpr TCHAR LegacyHavenConfigSection[] = TEXT("/Script/HavenEditor.HavenStaticMeshTextureExportSettings");
-	constexpr TCHAR LegacyAssetImportConfigSection[] = TEXT("/Script/AssetImportProjectEditor.AssetImportProjectStaticMeshTextureExportSettings");
-	constexpr TCHAR ConfigLastOutputRoot[] = TEXT("LastOutputRoot");
-
-	FString GetLastOutputRoot()
-	{
-		FString LastOutputRoot;
-		const bool bHasNewValue = GConfig->GetString(ConfigSection, ConfigLastOutputRoot, LastOutputRoot, GEditorPerProjectIni)
-			&& !LastOutputRoot.IsEmpty();
-		if (!bHasNewValue)
-		{
-			GConfig->GetString(LegacyHavenConfigSection, ConfigLastOutputRoot, LastOutputRoot, GEditorPerProjectIni);
-		}
-		if (LastOutputRoot.IsEmpty())
-		{
-			GConfig->GetString(LegacyAssetImportConfigSection, ConfigLastOutputRoot, LastOutputRoot, GEditorPerProjectIni);
-		}
-		if (!bHasNewValue && !LastOutputRoot.IsEmpty())
-		{
-			GConfig->SetString(ConfigSection, ConfigLastOutputRoot, *LastOutputRoot, GEditorPerProjectIni);
-			GConfig->Flush(false, GEditorPerProjectIni);
-		}
-		return LastOutputRoot;
-	}
-
 	struct FBakedMaterialData
 	{
 		TMap<FString, TArray<FColor>> MapPixels;
@@ -1905,11 +1879,6 @@ FFBXExporterResult ExportStaticMeshUnattended(UStaticMesh* StaticMesh, const FFB
 
 namespace Testing
 {
-	FString ReadAndMigrateLastOutputRoot()
-	{
-		return GetLastOutputRoot();
-	}
-
 	bool PublishStagedFiles(const FString& StagingDirectory, const FString& FinalDirectory, FString& OutError)
 	{
 		return PublishStagedDirectory(StagingDirectory, FinalDirectory, OutError);
@@ -2025,15 +1994,15 @@ void PopulateContentBrowserMenu(UToolMenu* Menu)
 		FSlateIcon(),
 		FUIAction(FExecuteAction::CreateLambda([SelectedAssets]()
 		{
-			ShowExportDialog(SelectedAssets);
+			AddAssetsToTab(SelectedAssets);
 		})));
 }
 
-FString LastOutputRoot() { return GetLastOutputRoot(); }
-
-void ShowExportDialog(const TArray<FAssetData>& SelectedAssets)
+FString LastOutputRoot()
 {
-	AddAssetsToTab(SelectedAssets);
+	FString Value;
+	GConfig->GetString(TEXT("/Script/FBX_Exporter.FBX_ExporterSettings"), TEXT("LastOutputRoot"), Value, GEditorPerProjectIni);
+	return Value;
 }
 
 }

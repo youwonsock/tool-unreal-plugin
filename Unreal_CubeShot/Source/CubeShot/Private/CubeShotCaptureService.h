@@ -43,12 +43,6 @@ public:
         FCubeShotImage& OutImage,
         FText& OutError);
 
-    bool CaptureAndComposite(
-        const FCubeShotOptions& Options,
-        ECubeShotDirection Direction,
-        int32 TargetResolution,
-        FCubeShotImage& OutImage,
-        FText& OutError);
     bool PrepareCompositeWork(FCubeShotRawFrame RawFrame, const FCubeShotOptions& Options,
         int32 TargetResolution, FCubeShotPixelWork& OutWork, FText& OutError);
     bool PrepareCaptureWork(const FCubeShotOptions& Options, ECubeShotDirection Direction,

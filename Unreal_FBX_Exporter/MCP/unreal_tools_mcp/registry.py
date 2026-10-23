@@ -1,5 +1,5 @@
 """Discover project-owned MCP providers without importing plugin code or loading Unreal."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -23,11 +23,10 @@ class Provider:
     tools: tuple[str, ...]
     manifest: Path
     enabled: bool
-    api_version: str = "1.0.0"
-    minimum_runtime_version: str = "1.0.0"
-    capabilities: tuple[str, ...] = ()
-    job_tools: dict[str, str] = field(default_factory=dict)
-    compatible_tool_sets: tuple[tuple[str, ...], ...] = ()
+    api_version: str
+    minimum_runtime_version: str
+    capabilities: tuple[str, ...]
+    job_tools: dict[str, str]
 
 
 def version(value):
@@ -37,7 +36,8 @@ def version(value):
 
 
 def ensure_runtime(provider):
-    if version(__version__) < version(provider.minimum_runtime_version):
+    if (version(__version__) < version(provider.minimum_runtime_version) or
+            version(__version__)[0] != version(provider.minimum_runtime_version)[0]):
         raise RuntimeError(f"{provider.plugin} requires Unreal Tools runtime {provider.minimum_runtime_version}; "
                            f"loaded {__version__}. Start a new Python process using the updated plugin.")
 
@@ -87,26 +87,21 @@ def read_manifest(path, *, enabled=True):
         raise ValueError(f"Invalid or duplicate tool names: {path}")
     if data.get("status_tool") not in names:
         raise ValueError(f"status_tool must belong to tools: {path}")
-    api = data.get("api_version", "1.0.0")
-    minimum = data.get("minimum_runtime_version", "1.0.0")
-    version(api)
-    version(minimum)
-    capabilities = data.get("capabilities", [])
+    api = data.get("api_version")
+    minimum = data.get("minimum_runtime_version")
+    if version(api)[0] != 2 or version(minimum)[0] != 2:
+        raise ValueError(f"Only API/runtime major version 2 manifests are supported: {path}")
+    capabilities = data.get("capabilities")
     if (not isinstance(capabilities, list) or any(not isinstance(item, str) or not item for item in capabilities)
             or len(set(capabilities)) != len(capabilities)):
         raise ValueError(f"Invalid capabilities: {path}")
-    jobs = data.get("job_tools", {})
-    if (not isinstance(jobs, dict) or set(jobs) - {"start", "status", "control"}
+    jobs = data.get("job_tools")
+    if (not isinstance(jobs, dict) or set(jobs) != {"start", "status", "control"}
             or any(not isinstance(name, str) or name not in names for name in jobs.values())
             or len(set(jobs.values())) != len(jobs)):
         raise ValueError(f"Invalid job_tools roles: {path}")
-    previous = data.get("compatible_tool_sets", [])
-    if (not isinstance(previous, list) or any(not isinstance(group, list) or not group or
-            any(not isinstance(name, str) or name not in names for name in group) or
-            len(set(group)) != len(group) for group in previous)):
-        raise ValueError(f"Invalid compatible_tool_sets: {path}")
     return Provider(provider_id, plugin, data["status_tool"], tuple(names), path, enabled,
-                    api, minimum, tuple(capabilities), dict(jobs), tuple(tuple(group) for group in previous))
+                    api, minimum, tuple(capabilities), dict(jobs))
 
 
 def plugin_descriptors(root):
@@ -123,8 +118,8 @@ def plugin_descriptors(root):
 
 def editor_supported(settings):
     for dimension, value in (("Platform", PLATFORM), ("Target", "Editor")):
-        allow = settings.get(dimension + "AllowList", settings.get("Whitelist" + dimension + "s"))
-        deny = settings.get(dimension + "DenyList", settings.get("Blacklist" + dimension + "s", []))
+        allow = settings.get(dimension + "AllowList")
+        deny = settings.get(dimension + "DenyList", [])
         if (allow and value not in allow) or value in deny:
             return False
     platforms = settings.get("SupportedTargetPlatforms")
@@ -132,6 +127,7 @@ def editor_supported(settings):
 
 
 def discover(project_file):
+    """Read manifests only for plugins enabled for this platform's Editor."""
     project_file = Path(project_file).resolve()
     descriptor = read_json(project_file)
     entries = descriptor.get("Plugins", [])
@@ -155,6 +151,10 @@ def discover(project_file):
             "Editor", "EditorNoCommandlet", "EditorAndProgram", "UncookedOnly", "Developer", "DeveloperTool",
             "Runtime", "RuntimeNoCommandlet", "RuntimeAndProgram"
         } and editor_supported(module) for module in modules)
+        # Disabled/filtered plugins cannot publish tools in this Editor. Their
+        # manifests may belong to an unsupported runtime and must not block it.
+        if not enabled:
+            continue
         provider = read_manifest(manifest, enabled=enabled)
         if provider.plugin != path.stem:
             raise ValueError(f"Manifest plugin {provider.plugin} does not match {path.name}")

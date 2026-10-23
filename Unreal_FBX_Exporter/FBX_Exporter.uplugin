@@ -1,7 +1,7 @@
 {
   "FileVersion": 3,
-  "Version": 3,
-  "VersionName": "1.2.0",
+  "Version": 4,
+  "VersionName": "2.0.0",
   "FriendlyName": "FBX_Exporter",
   "Description": "Editor-only Static Mesh FBX and texture exporter with self-contained MCP tools.",
   "Category": "Tools",

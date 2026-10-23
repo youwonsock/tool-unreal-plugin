@@ -3,8 +3,8 @@
   "id": "fbx_exporter",
   "plugin": "FBX_Exporter",
   "status_tool": "fbx_exporter_status",
-  "api_version": "1.2.0",
-  "minimum_runtime_version": "1.2.0",
+  "api_version": "2.0.0",
+  "minimum_runtime_version": "2.0.0",
   "capabilities": [
     "profiles",
     "jobs",
@@ -18,19 +18,10 @@
     "status": "fbx_exporter_job_status",
     "control": "fbx_exporter_job_control"
   },
-  "compatible_tool_sets": [
-    [
-      "fbx_exporter_status",
-      "fbx_exporter_find_meshes",
-      "fbx_exporter_preflight",
-      "fbx_exporter_export"
-    ]
-  ],
   "tools": [
     "fbx_exporter_status",
     "fbx_exporter_find_meshes",
     "fbx_exporter_preflight",
-    "fbx_exporter_export",
     "fbx_exporter_profiles",
     "fbx_exporter_job_start",
     "fbx_exporter_job_status",

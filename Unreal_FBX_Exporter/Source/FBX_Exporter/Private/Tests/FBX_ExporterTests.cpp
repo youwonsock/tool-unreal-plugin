@@ -9,6 +9,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Guid.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FFBXExporterSafeFileNameTest,
@@ -77,74 +78,28 @@ bool FFBXExporterTextureMapOptionsTest::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
-	FFBXExporterConfigMigrationTest,
-	"FBX_Exporter.Editor.StaticMeshTextureExport.ConfigMigration",
+	FFBXExporterCurrentOutputSettingsTest,
+	"FBX_Exporter.Editor.StaticMeshTextureExport.CurrentOutputSettings",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
-
-bool FFBXExporterConfigMigrationTest::RunTest(const FString& Parameters)
+bool FFBXExporterCurrentOutputSettingsTest::RunTest(const FString&)
 {
-	const TCHAR* ConfigSection = TEXT("/Script/FBX_Exporter.FBX_ExporterSettings");
-	const TCHAR* HavenLegacySection = TEXT("/Script/HavenEditor.HavenStaticMeshTextureExportSettings");
-	const TCHAR* AssetImportLegacySection = TEXT("/Script/AssetImportProjectEditor.AssetImportProjectStaticMeshTextureExportSettings");
-	const TCHAR* ConfigKey = TEXT("LastOutputRoot");
-	const FString IniFile = GEditorPerProjectIni;
-
-	struct FConfigValue
+	const TCHAR* Section = TEXT("/Script/FBX_Exporter.FBX_ExporterSettings");
+	const TCHAR* Key = TEXT("LastOutputRoot");
+	FString Original;
+	const bool Existed = GConfig->GetString(Section, Key, Original, GEditorPerProjectIni);
+	ON_SCOPE_EXIT
 	{
-		bool bExists = false;
-		FString Value;
+		if (Existed) GConfig->SetString(Section, Key, *Original, GEditorPerProjectIni);
+		else GConfig->RemoveKey(Section, Key, GEditorPerProjectIni);
 	};
-
-	auto ReadValue = [ConfigKey, &IniFile](const TCHAR* Section)
-	{
-		FConfigValue Result;
-		Result.bExists = GConfig->GetString(Section, ConfigKey, Result.Value, IniFile);
-		return Result;
-	};
-	auto RestoreValue = [ConfigKey, &IniFile](const TCHAR* Section, const FConfigValue& Value)
-	{
-		if (Value.bExists)
-		{
-			GConfig->SetString(Section, ConfigKey, *Value.Value, IniFile);
-		}
-		else
-		{
-			GConfig->RemoveKey(Section, ConfigKey, IniFile);
-		}
-	};
-
-	const FConfigValue OriginalNew = ReadValue(ConfigSection);
-	const FConfigValue OriginalHaven = ReadValue(HavenLegacySection);
-	const FConfigValue OriginalAssetImport = ReadValue(AssetImportLegacySection);
-
-	GConfig->RemoveKey(ConfigSection, ConfigKey, IniFile);
-	GConfig->SetString(HavenLegacySection, ConfigKey, TEXT("C:/Legacy/Haven"), IniFile);
-	GConfig->SetString(AssetImportLegacySection, ConfigKey, TEXT("C:/Legacy/AssetImportProject"), IniFile);
-	GConfig->Flush(false, IniFile);
-
-	const FString MigratedPath = FBXExporter::Testing::ReadAndMigrateLastOutputRoot();
-	TestEqual(TEXT("Haven legacy section is preferred"), MigratedPath, TEXT("C:/Legacy/Haven"));
-
-	FString NewPath;
-	TestTrue(TEXT("Migrated value is written to the new section"), GConfig->GetString(ConfigSection, ConfigKey, NewPath, IniFile));
-	TestEqual(TEXT("New section stores the migrated path"), NewPath, TEXT("C:/Legacy/Haven"));
-
-	GConfig->RemoveKey(ConfigSection, ConfigKey, IniFile);
-	GConfig->RemoveKey(HavenLegacySection, ConfigKey, IniFile);
-	GConfig->SetString(AssetImportLegacySection, ConfigKey, TEXT("C:/Legacy/AssetImportProject"), IniFile);
-	GConfig->Flush(false, IniFile);
-
-	const FString AssetImportMigratedPath = FBXExporter::Testing::ReadAndMigrateLastOutputRoot();
-	TestEqual(TEXT("AssetImportProject legacy section is used when Haven has no value"), AssetImportMigratedPath, TEXT("C:/Legacy/AssetImportProject"));
-
-	NewPath.Reset();
-	TestTrue(TEXT("AssetImportProject value is written to the new section"), GConfig->GetString(ConfigSection, ConfigKey, NewPath, IniFile));
-	TestEqual(TEXT("New section stores the AssetImportProject path"), NewPath, TEXT("C:/Legacy/AssetImportProject"));
-
-	RestoreValue(ConfigSection, OriginalNew);
-	RestoreValue(HavenLegacySection, OriginalHaven);
-	RestoreValue(AssetImportLegacySection, OriginalAssetImport);
-	GConfig->Flush(false, IniFile);
+	GConfig->RemoveKey(Section, Key, GEditorPerProjectIni);
+	TestTrue(TEXT("Missing current settings return an empty path"), FBXExporter::LastOutputRoot().IsEmpty());
+	FString Value;
+	TestFalse(TEXT("Reading defaults does not create a setting"), GConfig->GetString(Section, Key, Value, GEditorPerProjectIni));
+	GConfig->SetString(Section, Key, TEXT("C:/Current/Exports"), GEditorPerProjectIni);
+	TestEqual(TEXT("Current output settings are read without transformation"), FBXExporter::LastOutputRoot(), FString(TEXT("C:/Current/Exports")));
+	GConfig->SetString(Section, Key, TEXT(""), GEditorPerProjectIni);
+	TestTrue(TEXT("An explicitly empty current setting stays empty"), FBXExporter::LastOutputRoot().IsEmpty());
 	return true;
 }
 

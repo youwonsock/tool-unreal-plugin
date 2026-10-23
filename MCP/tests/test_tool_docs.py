@@ -28,7 +28,7 @@ class ToolDocsTests(ProjectCase):
         self.assertEqual(self.generate(), 0)
         self.assertEqual(self.generate(check=True), 0)
         snapshot = json.loads(self.cube.manifest.with_name("tool-spec.json").read_text("utf-8"))
-        self.assertEqual(len(snapshot["tools"]), 9)
+        self.assertEqual(len(snapshot["tools"]), 8)
         self.assertEqual(snapshot["tools"][0]["description"], "Actual server description")
         self.assertIn("### Output schema", self.cube.manifest.with_name("TOOL_REFERENCE.md").read_text("utf-8"))
         self.catalog["tools"][0]["inputSchema"]["properties"] = {"new_field": {"type": "string"}}
@@ -52,16 +52,14 @@ class ToolDocsTests(ProjectCase):
             self.generate()
         self.assertFalse(self.cube.manifest.with_name("tool-spec.json").exists())
 
-    def test_legacy_argument_example_and_full_call_examples_use_actual_tool_schema(self):
-        export = next(tool for tool in self.catalog["tools"] if tool["name"] == "fbx_exporter_export")
-        export["inputSchema"] = {"type": "object", "required": ["mesh_path"],
-                                 "properties": {"mesh_path": {"type": "string"}, "resolution": {"type": "integer"}}}
-        self.write("Plugins/Unreal_CubeShot/MCP/examples/statuses.json",
-                   json.dumps([{"tool": self.cube.status_tool, "arguments": {}}]))
+    def test_job_call_examples_use_actual_tool_schema(self):
+        start = next(tool for tool in self.catalog["tools"] if tool["name"] == self.fbx.job_tools["start"])
+        start["inputSchema"] = {"type": "object", "required": ["mesh_paths"],
+                                "properties": {"mesh_paths": {"type": "array", "items": {"type": "string"}}}}
         self.assertEqual(self.generate(), 0)
-        example = self.fbx.manifest.with_name("export-arguments.example.json")
-        example.write_text('{"mesh_path":"/Game/Cube.Cube","resolution":"wrong"}', "utf-8")
-        with self.assertRaisesRegex(ValueError, "export-arguments.example"):
+        example = self.fbx.manifest.parent / "examples/job-start.json"
+        example.write_text(json.dumps({"tool": self.fbx.job_tools["start"], "arguments": {"mesh_paths": "wrong"}}), "utf-8")
+        with self.assertRaisesRegex(ValueError, "job-start"):
             self.generate(check=True)
 
     def test_parser_accepts_direct_cli_and_jsonrpc_catalogs_but_rejects_duplicates(self):
@@ -79,6 +77,13 @@ class ToolDocsTests(ProjectCase):
         text = self.cube.manifest.with_name("TOOL_REFERENCE.md").read_text("utf-8")
         self.assertIn("Actual server description", text)
         self.assertIn("does not advertise an output schema", text)
+
+    def test_a_stale_editor_catalogue_with_retired_tools_cannot_be_published_as_current(self):
+        self.catalog["tools"].append({"name": "cubeshot_generate", "inputSchema": {"type": "object"}})
+        with self.assertRaisesRegex(ValueError, "unsupported cubeshot tools"):
+            self.generate()
+        self.assertFalse(self.cube.manifest.with_name("tool-spec.json").exists())
+        self.assertFalse(self.fbx.manifest.with_name("tool-spec.json").exists())
 
     def test_job_identity_reference_explains_exactly_one_published_identifier(self):
         tool = next(tool for tool in self.catalog["tools"] if tool["name"] == self.cube.job_tools["control"])
